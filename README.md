@@ -2,8 +2,5 @@
 
 ```
       - name: Set up WARP
-        uses: alphaxcv/warp-on-actions@1.0
-        with:
-          stack: dual
-          mode: wireguard
+        uses: alphaxcv/warpx@1.0
 ```
