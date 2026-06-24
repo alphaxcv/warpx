@@ -1,140 +1,80 @@
-name: 'Install WARP'
-author: 'jfu'
-description: 'Install Cloudflare Warp on Github actions'
+name: 'Setup WARP Global Proxy'
+description: 'Install Cloudflare WARP in proxy mode, achieve global proxy for subsequent steps, split-tunnel runner traffic to keep logs LIVE, and support on-demand IP rotation.'
 
 inputs:
-  stack:
-    description: 'Choose WARP stacks: IPv4/IPv6 only or dualstacks.'
+  proxy_port:
+    description: 'SOCKS5 proxy port'
     required: false
-    default: 'dual'
-
-  mode:
-    description: 'Choose WARP mode: wireguard or client.'
+    default: '40000'
+  export_global:
+    description: 'Automatically export proxy envs to subsequent steps'
     required: false
-    default: 'wireguard'
+    default: 'true'
 
 runs:
   using: composite
   steps:
-    - name: Install WARP
+    - name: Install and Connect WARP
+      shell: bash
       run: |
-        if [ "${{ inputs.mode }}" == 'client' ]; then
-          echo "WARP mode: client warp+doh."
-          sudo apt-get -y update
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-          sudo warp-cli --accept-tos registration new
-          sudo warp-cli --accept-tos mode warp+doh
-          if [ "${{ inputs.stack }}" == 'ipv4' ]; then
-            sudo warp-cli --accept-tos tunnel ip add-range ::0/0
-          elif [ "${{ inputs.stack }}" == 'ipv6' ]; then
-            sudo warp-cli --accept-tos tunnel ip add-range 0.0.0.0/0
-          fi
-          echo "Connecting WARP client..."
-          client_connected=0
-          for attempt in $(seq 1 8); do
-            echo "WARP client connect attempt $attempt/8..."
-            sudo warp-cli --accept-tos disconnect 2>/dev/null || true
-            sudo warp-cli --accept-tos connect
-            if timeout 30 bash -c 'until sudo warp-cli status 2>/dev/null | grep -q "Connected"; do sleep 1; done'; then
-              client_connected=1
-              echo "WARP client connected on attempt $attempt"
-              break
-            fi
-            echo "Attempt $attempt failed, retrying..."
-            sleep $((attempt * 3))
-          done
-          if [ $client_connected -ne 1 ]; then
-            echo "WARP client failed to connect after 8 attempts"
-            exit 1
-          fi
+        set -e
 
-        elif [ "${{ inputs.mode }}" == 'wireguard' ]; then
-          echo "WARP mode: wireguard."
-          sudo apt-get -y update
-          if [ "$(lsb_release -is 2>/dev/null)" = "Ubuntu" ] && [ "$(lsb_release -rs | awk -F. '{print $1$2}')" -ge 2404 ]; then
-            sudo apt-get -y install --no-install-recommends net-tools iproute2 resolvconf dnsutils iptables wireguard-tools
-          else
-            sudo apt-get -y install --no-install-recommends net-tools iproute2 openresolv dnsutils iptables wireguard-tools
-          fi
-          LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-          CONFIG="[Interface]
-          PrivateKey = cKE7LmCF61IhqqABGhvJ44jWXp8fKymcMAEVAzbDF2k=
-          Address = 172.16.0.2/32
-          Address = fd01:5ca1:ab1e:823e:e094:eb1c:ff87:1fab/128
-          PostUp = ip -4 rule add from $LAN lookup main
-          PostDown = ip -4 rule delete from $LAN lookup main
-          DNS = 1.1.1.1,8.8.8.8,8.8.4.4,2606:4700:4700::1111,2001:4860:4860::8888,2001:4860:4860::8844
-          MTU = 1280
+        echo ">>> [1/4] Installing cloudflare-warp..."
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
 
-          [Peer]
-          PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-          "
+        echo ">>> [2/4] Starting warp-svc..."
+        sudo systemctl enable --now warp-svc
+        sleep 3
 
-          if [ "${{ inputs.stack }}" == 'ipv4' ]; then
-            CONFIG+="AllowedIPs = 0.0.0.0/0
-            "
-          elif [ "${{ inputs.stack }}" == 'ipv6' ]; then
-            CONFIG+="AllowedIPs = ::/0
-            "
-          else
-            CONFIG+="AllowedIPs = 0.0.0.0/0
-            AllowedIPs = ::/0
-            "
-          fi
-          CONFIG+="Endpoint = engage.cloudflareclient.com:2408"
-          echo "$CONFIG" | sed "s/^[ ]\+//g" | sudo tee /etc/wireguard/warp.conf
-
-          MAX_RETRIES=8
-          for attempt in $(seq 1 $MAX_RETRIES); do
-            echo "WARP connect attempt $attempt/$MAX_RETRIES..."
-            sudo wg-quick down warp 2>/dev/null || true
-            sudo wg-quick up warp
-
-            connected=0
-            for i in $(seq 1 30); do
-              if sudo wg show warp latest-handshakes 2>/dev/null | grep -qE '[1-9][0-9]*'; then
-                connected=1
-                break
-              fi
-              sleep 2
-            done
-
-            if [ $connected -eq 1 ]; then
-              echo "WARP connected on attempt $attempt"
-              break
-            fi
-
-            echo "Attempt $attempt failed, retrying..."
-            sleep $((attempt * 3))
-            if [ $attempt -eq $MAX_RETRIES ]; then
-              echo "WARP failed after $MAX_RETRIES attempts"
-              exit 1
-            fi
-          done
-
-        else
-          echo -e "WARP mode: ${{ inputs.mode }}.\nYou can choose client or wireguard."
-          exit 1
-        fi
-
-        echo -e "===============================\nIP:"
+        echo ">>> [3/4] Configuring WARP in Proxy Mode (Port: ${{ inputs.proxy_port }})..."
+        sudo warp-cli --accept-tos registration new
+        sudo warp-cli --accept-tos mode proxy
+        sudo warp-cli --accept-tos proxy port ${{ inputs.proxy_port }}
+        sudo warp-cli --accept-tos connect
         
-        # 核心修复 1：等待路由和 DNS 彻底生效（极大地减少超时和获取失败）
         echo "Waiting 5 seconds for network routes to stabilize..."
         sleep 5
 
-        # 核心修复 2：极简、高效的 Cloudflare 原生 Trace 接口提取
+        echo ">>> [4/4] Creating IP rotation utility: warp-rotate"
+        # 封装一个全局命令，后续任意步骤执行 warp-rotate 即可直接刷新 IP
+        PORT="${{ inputs.proxy_port }}"
+        sudo tee /usr/local/bin/warp-rotate << EOF
+        #!/bin/bash
+        echo ">>> Rotating WARP IP..."
+        sudo warp-cli --accept-tos registration new
+        sleep 2
+        echo -n ">>> New WARP Exit IP: "
+        curl -s -x socks5h://127.0.0.1:\${PORT} --connect-timeout 5 https://api.ipify.org || echo "N/A"
+        EOF
+        sudo chmod +x /usr/local/bin/warp-rotate
+
+        # 核心分流与全局代理设置
+        if [ "${{ inputs.export_global }}" == "true" ]; then
+          echo ">>> Injecting global proxy environment variables..."
+          PROXY_URL="socks5h://127.0.0.1:${{ inputs.proxy_port }}"
+          
+          # 注入后续步骤默认使用的代理
+          echo "http_proxy=$PROXY_URL" >> $GITHUB_ENV
+          echo "https_proxy=$PROXY_URL" >> $GITHUB_ENV
+          echo "ALL_PROXY=$PROXY_URL" >> $GITHUB_ENV
+          
+          # 严格分流：确保访问 GitHub 自身服务的流量绝对不走代理，防止日志中断
+          NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,github.com,api.github.com,actions.githubusercontent.com,githubassets.com"
+          echo "no_proxy=$NO_PROXY_LIST" >> $GITHUB_ENV
+          echo "NO_PROXY=$NO_PROXY_LIST" >> $GITHUB_ENV
+        fi
+
+        # 验证网络状态
+        echo -e "\n======================================"
+        echo "Network Verification:"
+        
         get_ip() {
-            local flag=$1
             local result
-            
             for attempt in {1..3}; do
-                result=$(curl -s $flag --connect-timeout 3 --max-time 5 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null)
-                
-                # 校验返回值是否包含 ip= 字段，防止获取到空值或错误页面
+                result=$(curl -s -x socks5h://127.0.0.1:${{ inputs.proxy_port }} --connect-timeout 3 --max-time 5 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null)
                 if [[ -n "$result" && "$result" == *"ip="* ]]; then
                     echo "$result" | grep -E "^ip=" | cut -d= -f2
                     return
@@ -144,7 +84,6 @@ runs:
             echo "N/A"
         }
 
-        echo "IPv4: $(get_ip "-4")"
-        echo "IPv6: $(get_ip "-6")"
-
-      shell: bash
+        echo "WARP Proxy Exit IP: $(get_ip)"
+        echo "Runner Native Direct IP: $(curl -s --connect-timeout 5 https://api.ipify.org || echo 'N/A')"
+        echo "======================================"
