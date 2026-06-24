@@ -1,5 +1,5 @@
 name: 'Setup Global WARP (Runner Bypassed)'
-description: 'Install Cloudflare WARP in global mode, using routing rules to bypass the runner and keep logs LIVE.'
+description: 'Install WARP globally, bypassing the runner via dedicated routing table to keep logs LIVE.'
 
 runs:
   using: composite
@@ -12,21 +12,16 @@ runs:
         export DEBIAN_FRONTEND=noninteractive
         export NEEDRESTART_SUSPEND=1
 
-        echo "Adding Cloudflare WARP repository..."
+        echo ">>> Installing cloudflare-warp..."
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        
-        echo "Updating package lists..."
         sudo apt-get update -qq
-
-        echo "Installing cloudflare-warp..."
         sudo apt-get install -y -qq cloudflare-warp
 
-        echo "Starting warp-svc daemon..."
         sudo systemctl restart warp-svc
         sleep 3
 
-        echo "Registering WARP client..."
+        echo ">>> Registering WARP client..."
         REGISTERED=0
         for attempt in {1..5}; do
           if timeout 15 sudo warp-cli --accept-tos registration new >/dev/null 2>&1; then
@@ -42,42 +37,50 @@ runs:
           exit 1
         fi
 
-        echo "Setting WARP mode to global tunnel..."
         sudo warp-cli --accept-tos mode warp >/dev/null
 
-        echo "Applying Runner bypass routing (BEFORE connecting)..."
-        # 【致命修复】必须在连接 WARP 前获取 Runner IP，并打上最高优先级(pref 10)的直连规则
-        LAN=$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+')
-        sudo ip -4 rule add from $LAN lookup main pref 10 2>/dev/null || true
+        echo ">>> Preparing clean routing table for Runner bypass..."
+        # 1. 绝对复刻你原来的 LAN IP 获取方式，使用 192.168.193.10 触发正确的网卡出口
+        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        
+        # 2. 在 WARP 破坏路由表前，把真实的直连网关和网卡抓取出来
+        ORIG_GW=$(ip -4 route show default | head -n 1 | awk '/default/ {print $3}')
+        ORIG_IF=$(ip -4 route show default | head -n 1 | awk '/default/ {print $5}')
+        
+        # 3. 把这条干净的直连规则存入自定义路由表 111 备用
+        sudo ip route add default via $ORIG_GW dev $ORIG_IF table 111 2>/dev/null || true
 
-        echo "Connecting to WARP..."
+        echo ">>> Connecting to WARP..."
         sudo warp-cli --accept-tos connect >/dev/null
 
-        echo "Verifying connection status..."
+        echo ">>> Applying Runner bypass routing..."
+        # 4. 关键：刚连上 WARP（防清空），立刻打上你的分流神技！指向我们备份的 111 表，并赋予最高优先级(pref 5)
+        sudo ip -4 rule add from $LAN lookup 111 pref 5 2>/dev/null || true
+
+        echo ">>> Verifying connection status..."
         for i in {1..15}; do
           if sudo warp-cli --accept-tos status | grep -q "Connected"; then
-            echo "WARP connected successfully."
             break
           fi
           sleep 1
         done
-
-        echo "Waiting for network routes to stabilize..."
         sleep 5
 
         CURRENT_IP=$(curl -s --connect-timeout 5 https://api.ipify.org || echo "Unknown")
         echo "Current outbound IP: $CURRENT_IP"
 
-        echo "Creating warp-rotate utility..."
-        # 换 IP 脚本。因为刚才配的最高优先级路由是永久生效的，这里只需要断开重连刷 IP 即可
-        echo "sudo warp-cli --accept-tos disconnect >/dev/null 2>&1" | sudo tee /usr/local/bin/warp-rotate >/dev/null
+        echo ">>> Creating warp-rotate utility..."
+        # 封装换 IP 脚本，重连后再次补充我们的 111 表分流规则，确保万无一失
+        echo "#!/bin/bash" | sudo tee /usr/local/bin/warp-rotate >/dev/null
+        echo "sudo warp-cli --accept-tos disconnect >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "sleep 1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "sudo warp-cli --accept-tos registration new >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "sudo warp-cli --accept-tos connect >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
-        echo "sleep 5" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "sleep 4" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "sudo ip -4 rule add from $LAN lookup 111 pref 5 2>/dev/null || true" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "NEW_IP=\$(curl -s --connect-timeout 5 https://api.ipify.org || echo 'Unknown')" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "echo \"New outbound IP: \$NEW_IP\"" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         
         sudo chmod +x /usr/local/bin/warp-rotate
 
-        echo "WARP setup complete."
+        echo ">>> WARP setup complete."
