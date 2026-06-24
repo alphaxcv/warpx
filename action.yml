@@ -1,89 +1,56 @@
-name: 'Setup WARP Global Proxy'
-description: 'Install Cloudflare WARP in proxy mode, achieve global proxy for subsequent steps, split-tunnel runner traffic to keep logs LIVE, and support on-demand IP rotation.'
+name: 'Setup WARP (proxy mode)'
+description: 'Install Cloudflare WARP in proxy mode'
 
 inputs:
-  proxy_port:
+  port:
     description: 'SOCKS5 proxy port'
     required: false
     default: '40000'
-  export_global:
-    description: 'Automatically export proxy envs to subsequent steps'
-    required: false
-    default: 'true'
 
 runs:
   using: composite
   steps:
-    - name: Install and Connect WARP
+    - name: Install and connect WARP
       shell: bash
       run: |
         set -e
 
-        echo ">>> [1/4] Installing cloudflare-warp..."
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        # 核心修复：强行挂起新版 Ubuntu 的 needrestart 机制，阻止其抛出 exit code 8
+        export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_SUSPEND=1
+
+        echo ">>> [1/4] Installing cloudflare-warp dependencies & repo..."
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        
         sudo apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
 
-        echo ">>> [2/4] Starting warp-svc..."
+        echo ">>> [2/4] Executing apt-get install..."
+        # 双重保险，在命令行级别注入挂起变量
+        sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
+
+        echo ">>> [3/4] Starting warp-svc..."
         sudo systemctl enable --now warp-svc
-        sleep 3
+        
+        # 增加守护进程就绪状态轮询，防止配置命令下发过快导致连接失败
+        for i in {1..10}; do
+          if sudo warp-cli --accept-tos status >/dev/null 2>&1; then
+            echo "warp-svc is fully initialized."
+            break
+          fi
+          echo "Waiting for warp-svc socket..."
+          sleep 1
+        done
 
-        echo ">>> [3/4] Configuring WARP in Proxy Mode (Port: ${{ inputs.proxy_port }})..."
+        echo ">>> [4/4] Configuring WARP into Proxy Mode..."
         sudo warp-cli --accept-tos registration new
         sudo warp-cli --accept-tos mode proxy
-        sudo warp-cli --accept-tos proxy port ${{ inputs.proxy_port }}
+        sudo warp-cli --accept-tos proxy port ${{ inputs.port }}
         sudo warp-cli --accept-tos connect
-        
-        echo "Waiting 5 seconds for network routes to stabilize..."
-        sleep 5
 
-        echo ">>> [4/4] Creating IP rotation utility: warp-rotate"
-        # 封装一个全局命令，后续任意步骤执行 warp-rotate 即可直接刷新 IP
-        PORT="${{ inputs.proxy_port }}"
-        sudo tee /usr/local/bin/warp-rotate << EOF
-        #!/bin/bash
-        echo ">>> Rotating WARP IP..."
-        sudo warp-cli --accept-tos registration new
-        sleep 2
-        echo -n ">>> New WARP Exit IP: "
-        curl -s -x socks5h://127.0.0.1:\${PORT} --connect-timeout 5 https://api.ipify.org || echo "N/A"
-        EOF
-        sudo chmod +x /usr/local/bin/warp-rotate
-
-        # 核心分流与全局代理设置
-        if [ "${{ inputs.export_global }}" == "true" ]; then
-          echo ">>> Injecting global proxy environment variables..."
-          PROXY_URL="socks5h://127.0.0.1:${{ inputs.proxy_port }}"
-          
-          # 注入后续步骤默认使用的代理
-          echo "http_proxy=$PROXY_URL" >> $GITHUB_ENV
-          echo "https_proxy=$PROXY_URL" >> $GITHUB_ENV
-          echo "ALL_PROXY=$PROXY_URL" >> $GITHUB_ENV
-          
-          # 严格分流：确保访问 GitHub 自身服务的流量绝对不走代理，防止日志中断
-          NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,github.com,api.github.com,actions.githubusercontent.com,githubassets.com"
-          echo "no_proxy=$NO_PROXY_LIST" >> $GITHUB_ENV
-          echo "NO_PROXY=$NO_PROXY_LIST" >> $GITHUB_ENV
-        fi
-
-        # 验证网络状态
-        echo -e "\n======================================"
-        echo "Network Verification:"
-        
-        get_ip() {
-            local result
-            for attempt in {1..3}; do
-                result=$(curl -s -x socks5h://127.0.0.1:${{ inputs.proxy_port }} --connect-timeout 3 --max-time 5 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null)
-                if [[ -n "$result" && "$result" == *"ip="* ]]; then
-                    echo "$result" | grep -E "^ip=" | cut -d= -f2
-                    return
-                fi
-                sleep 2
-            done
-            echo "N/A"
-        }
-
-        echo "WARP Proxy Exit IP: $(get_ip)"
-        echo "Runner Native Direct IP: $(curl -s --connect-timeout 5 https://api.ipify.org || echo 'N/A')"
-        echo "======================================"
+        echo "========================================="
+        echo "WARP successfully initialized in Proxy Mode on port ${{ inputs.port }}!"
+        echo "========================================="
