@@ -1,5 +1,5 @@
 name: 'Setup Global WARP (Runner Bypassed)'
-description: 'Install Cloudflare WARP in global mod'
+description: 'Install Cloudflare WARP in global mode, using routing rules to bypass the runner and keep logs LIVE.'
 
 runs:
   using: composite
@@ -9,7 +9,6 @@ runs:
       run: |
         set -e
 
-        # 阻止 Ubuntu 24.04+ 因 needrestart 机制引发的 apt 换版报错
         export DEBIAN_FRONTEND=noninteractive
         export NEEDRESTART_SUSPEND=1
 
@@ -24,22 +23,34 @@ runs:
         sudo apt-get install -y -qq cloudflare-warp
 
         echo "Starting warp-svc daemon..."
-        sudo systemctl enable --now warp-svc
-        
-        echo "Waiting for daemon to initialize..."
-        for i in {1..10}; do
-          if sudo warp-cli --accept-tos status >/dev/null 2>&1; then break; fi
-          sleep 1
+        sudo systemctl restart warp-svc
+        sleep 3
+
+        echo "Registering WARP client (with timeout protection)..."
+        # 【核心修复】加入超时切断和重试机制，防止 API 握手死锁
+        REGISTERED=0
+        for attempt in {1..5}; do
+          echo "Registration attempt $attempt/5..."
+          # 限制 15 秒必须返回结果，否则强制掐断重试
+          if timeout 15 sudo warp-cli --accept-tos registration new; then
+            REGISTERED=1
+            break
+          fi
+          echo "Attempt $attempt timed out or failed. Restarting daemon..."
+          sudo systemctl restart warp-svc
+          sleep 3
         done
 
-        echo "Registering WARP client..."
-        sudo warp-cli --accept-tos registration new >/dev/null
+        if [ $REGISTERED -ne 1 ]; then
+          echo "ERROR: WARP failed to register after 5 attempts."
+          exit 1
+        fi
 
         echo "Setting WARP mode to global tunnel..."
-        sudo warp-cli --accept-tos mode warp >/dev/null
+        sudo warp-cli --accept-tos mode warp
 
         echo "Connecting to WARP..."
-        sudo warp-cli --accept-tos connect >/dev/null
+        sudo warp-cli --accept-tos connect
 
         echo "Verifying connection status..."
         for i in {1..15}; do
@@ -51,7 +62,7 @@ runs:
         done
 
         echo "Applying Runner bypass routing..."
-        # 【核心】让 Runner 进程绑定的本地 IP 强制走主路由表直连
+        # 强制 Runner 进程绑定的本地 IP 走主路由表直连
         LAN=$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+')
         sudo ip -4 rule add from $LAN lookup main 2>/dev/null || true
 
@@ -62,7 +73,6 @@ runs:
         echo "Current outbound IP: $CURRENT_IP"
 
         echo "Creating warp-rotate utility..."
-        # 换 IP 脚本，重连后再次补充路由规则，确保万无一失
         echo "sudo warp-cli --accept-tos disconnect >/dev/null 2>&1" | sudo tee /usr/local/bin/warp-rotate >/dev/null
         echo "sleep 1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         echo "sudo warp-cli --accept-tos registration new >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
