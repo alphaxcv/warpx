@@ -1,43 +1,43 @@
-name: 'Setup WARP (Manual Route Protection)'
-description: 'Uses a watchdog script to maintain routing rules against warp-svc interference.'
+name: 'Setup WARP'
+description: 'Setup Cloudflare WARP with static routing to bypass runner'
 
 runs:
   using: composite
   steps:
-    - name: Configure and Connect
+    - name: Install and Configure
       shell: bash
       run: |
         set -e
-        # 1. 安装
+        # 1. 安装 Cloudflare WARP
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq cloudflare-warp
 
-        # 2. 基础配置
-        sudo systemctl enable --now warp-svc
-        sudo warp-cli --accept-tos registration new >/dev/null
-        sudo warp-cli --accept-tos mode warp >/dev/null
-        sudo warp-cli --accept-tos connect >/dev/null
-        sleep 3
+        # 2. 注册并设置模式
+        sudo warp-cli --accept-tos registration new >/dev/null 2>&1
+        sudo warp-cli --accept-tos mode warp >/dev/null 2>&1
 
-        # 3. 核心：这就是你想要的“原始代码分流逻辑”
-        # 我们获取 LAN IP，并强制给它加一个最高优先级的路由规则
+        # 3. 核心分流：强制 Runner 走主路由直连
+        # 获取当前 Runner 出口网卡的真实 IP
         LAN=$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+')
-        sudo ip -4 rule add from $LAN lookup main pref 10 || true
+        # 添加高优先级路由规则 (pref 10)，确保流量优先走主路由表
+        sudo ip -4 rule add from $LAN lookup main pref 10
 
-        # 4. “狗哨”进程（Watchdog）：解决 warp-svc 频繁覆盖路由表的问题
-        # 只要检测到 warp-svc 搞乱了规则，它就自动补回来
-        cat <<'EOF' | sudo tee /usr/local/bin/warp-watchdog >/dev/null
+        # 4. 连接 WARP
+        sudo warp-cli --accept-tos connect >/dev/null 2>&1
+        
+        # 5. 生成旋转 IP 的脚本，复用同一个逻辑
+        cat <<EOF | sudo tee /usr/local/bin/warp-rotate >/dev/null
         #!/bin/bash
-        LAN=$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+')
-        while true; do
-            if ! ip -4 rule show | grep -q "from $LAN lookup main"; then
-                sudo ip -4 rule add from $LAN lookup main pref 10 2>/dev/null || true
-            fi
-            sleep 2
-        done
+        sudo warp-cli --accept-tos disconnect >/dev/null 2>&1
+        sudo warp-cli --accept-tos registration new >/dev/null 2>&1
+        sudo warp-cli --accept-tos connect >/dev/null 2>&1
+        # 换完 IP 后确保分流规则依然有效
+        LAN=\$(ip -4 route get 8.8.8.8 | grep -oP 'src \K\S+')
+        sudo ip -4 rule add from \$LAN lookup main pref 10 2>/dev/null || true
+        echo "IP rotated to: \$(curl -s https://api.ipify.org)"
         EOF
-        sudo chmod +x /usr/local/bin/warp-watchdog
-        sudo nohup /usr/local/bin/warp-watchdog >/dev/null 2>&1 &
+        sudo chmod +x /usr/local/bin/warp-rotate
 
-        echo "WARP setup complete. Runner logs will stay LIVE."
+        echo "Setup complete. Current IP: $(curl -s https://api.ipify.org)"
