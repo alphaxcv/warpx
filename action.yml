@@ -61,22 +61,18 @@ runs:
         echo "Waiting for network routes to stabilize..."
         sleep 5
 
-        # 恢复初始化后的 IP 检测输出
         echo "Current outbound IP:"
         curl -s --connect-timeout 5 https://api.ipify.org || echo "Unknown"
 
+        # 使用标准的 echo 追加模式，完美规避 YAML 缩进冲突
         echo "Creating warp-rotate utility..."
-        sudo tee /usr/local/bin/warp-rotate << 'EOF'
-#!/bin/bash
-echo "Rotating WARP IP..."
-sudo warp-cli --accept-tos disconnect >/dev/null 2>&1
-sleep 1
-sudo warp-cli --accept-tos registration new >/dev/null 2>&1
-sudo warp-cli --accept-tos connect >/dev/null 2>&1
-sleep 5
-echo "New outbound IP:"
-curl -s --connect-timeout 5 https://api.ipify.org || echo "Unknown"
-EOF
+        echo "sudo warp-cli --accept-tos disconnect >/dev/null 2>&1" | sudo tee /usr/local/bin/warp-rotate >/dev/null
+        echo "sleep 1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "sudo warp-cli --accept-tos registration new >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "sudo warp-cli --accept-tos connect >/dev/null 2>&1" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "sleep 5" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "echo 'New outbound IP:'" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo "curl -s --connect-timeout 5 https://api.ipify.org || echo 'Unknown'" | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
         sudo chmod +x /usr/local/bin/warp-rotate
 
         echo "WARP setup complete."
