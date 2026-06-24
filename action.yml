@@ -1,75 +1,82 @@
-name: 'Setup WARP (Global VPN Mode with GitHub Bypass)'
-description: 'Install Cloudflare WARP in global tunnel mode but bypass GitHub to keep logs LIVE.'
+name: 'Setup Global WARP with GitHub Bypass'
+description: 'Install and configure Cloudflare WARP in global mode while bypassing GitHub traffic.'
 
 runs:
   using: composite
   steps:
-    - name: Install and Connect WARP with Bypass
+    - name: Configure and Connect WARP
       shell: bash
       run: |
         set -e
 
-        # 1. 修复 Ubuntu 24.04 因 needrestart 机制引发的 apt-get exit code 8 崩溃
+        # 阻止 Ubuntu 24.04+ 因 needrestart 机制引发的 apt 换版报错
         export DEBIAN_FRONTEND=noninteractive
         export NEEDRESTART_SUSPEND=1
 
-        echo ">>> [1/5] Adding Cloudflare WARP repository..."
+        echo "Adding Cloudflare WARP repository..."
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         
+        echo "Updating package lists..."
         sudo apt-get update -qq
 
-        echo ">>> [2/5] Installing cloudflare-warp..."
-        sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cloudflare-warp
+        echo "Installing cloudflare-warp..."
+        sudo apt-get install -y -qq cloudflare-warp
 
-        echo ">>> [3/5] Starting warp-svc daemon..."
+        echo "Starting warp-svc daemon..."
         sudo systemctl enable --now warp-svc
         
-        # 轮询等待守护进程就绪
+        echo "Waiting for daemon to initialize..."
         for i in {1..10}; do
           if sudo warp-cli --accept-tos status >/dev/null 2>&1; then break; fi
           sleep 1
         done
 
-        echo ">>> [4/5] Configuring Split Tunnel to bypass GitHub (Keep Logs LIVE)..."
-        # 【核心改动】把 GitHub 核心域名排除在虚拟网卡之外，让 Runner 传输日志永远走原网直连
-        sudo warp-cli --accept-tos split-tunnel add github.com || sudo warp-cli --accept-tos tunnel host add github.com
-        sudo warp-cli --accept-tos split-tunnel add api.github.com || sudo warp-cli --accept-tos tunnel host add api.github.com
-        sudo warp-cli --accept-tos split-tunnel add actions.githubusercontent.com || sudo warp-cli --accept-tos tunnel host add actions.githubusercontent.com
-        sudo warp-cli --accept-tos split-tunnel add githubassets.com || sudo warp-cli --accept-tos tunnel host add githubassets.com
-        sudo warp-cli --accept-tos split-tunnel add pipelines.actions.githubusercontent.com || sudo warp-cli --accept-tos tunnel host add pipelines.actions.githubusercontent.com
-
-        echo ">>> [5/5] Connecting WARP into Global VPN Mode..."
+        echo "Registering WARP client..."
         sudo warp-cli --accept-tos registration new
+
+        echo "Setting WARP mode to global tunnel..."
         sudo warp-cli --accept-tos mode warp
+
+        echo "Configuring split tunnel exclusions for GitHub..."
+        sudo warp-cli --accept-tos tunnel host add github.com
+        sudo warp-cli --accept-tos tunnel host add api.github.com
+        sudo warp-cli --accept-tos tunnel host add actions.githubusercontent.com
+        sudo warp-cli --accept-tos tunnel host add githubassets.com
+        sudo warp-cli --accept-tos tunnel host add pipelines.actions.githubusercontent.com
+
+        echo "Connecting to WARP..."
         sudo warp-cli --accept-tos connect
 
-        # 等待虚拟网卡获取 IP 并成功连接
-        echo "Waiting for tunnel connection..."
+        echo "Verifying connection status..."
         for i in {1..15}; do
           if sudo warp-cli --accept-tos status | grep -q "Connected"; then
-            echo "WARP Global Tunnel Connected!"
+            echo "WARP connected successfully."
             break
           fi
           sleep 1
         done
 
-        # 封装【全局 IP 切换快捷命令】: warp-rotate
-        # 重新注册时保持分流规则，只冲刷注册换 IP
+        # 等待路由和 DNS 彻底生效，防止立即查询时超时
+        echo "Waiting for network routes to stabilize..."
+        sleep 5
+
+        # 恢复初始化后的 IP 检测输出
+        echo "Current outbound IP:"
+        curl -s --connect-timeout 5 https://api.ipify.org || echo "Unknown"
+
+        echo "Creating warp-rotate utility..."
         sudo tee /usr/local/bin/warp-rotate << 'EOF'
-        #!/bin/bash
-        echo ">>> Rotating Global WARP IP..."
-        sudo warp-cli --accept-tos disconnect >/dev/null 2>&1
-        sleep 1
-        sudo warp-cli --accept-tos registration new >/dev/null 2>&1
-        sudo warp-cli --accept-tos connect >/dev/null 2>&1
-        sleep 4
-        echo -n ">>> New Global Exit IP: "
-        curl -s --connect-timeout 5 https://api.ipify.org || echo "N/A"
-        EOF
+#!/bin/bash
+echo "Rotating WARP IP..."
+sudo warp-cli --accept-tos disconnect >/dev/null 2>&1
+sleep 1
+sudo warp-cli --accept-tos registration new >/dev/null 2>&1
+sudo warp-cli --accept-tos connect >/dev/null 2>&1
+sleep 5
+echo "New outbound IP:"
+curl -s --connect-timeout 5 https://api.ipify.org || echo "Unknown"
+EOF
         sudo chmod +x /usr/local/bin/warp-rotate
 
-        echo "========================================="
-        echo "WARP Mode: GLOBAL VPN (With GitHub Bypassed)"
-        echo "Current System Exit IP: $(curl -s --connect-timeout 5 https://api.ipify.org)"
-        echo "========================================="
+        echo "WARP setup complete."
