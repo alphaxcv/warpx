@@ -1,5 +1,5 @@
 name: Setup WARP
-description: WARP in network namespace (global for renew, runner logs unaffected) + warp-rotate
+description: Global WARP (WireGuard) + ip rule from LAN + warp-rotate
 
 runs:
   using: composite
@@ -12,15 +12,13 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
 
-        sudo ip netns add warp 2>/dev/null || true
-        sudo ip netns exec warp ip link set lo up
-        sudo mkdir -p /etc/netns/warp
-        echo "nameserver 1.1.1.1" | sudo tee /etc/netns/warp/resolv.conf >/dev/null
-
-        sudo tee /etc/wireguard/warp.conf >/dev/null <<'EOF'
+        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        sudo tee /etc/wireguard/warp.conf >/dev/null <<EOF
         [Interface]
         PrivateKey = cKE7LmCF61IhqqABGhvJ44jWXp8fKymcMAEVAzbDF2k=
         Address = 172.16.0.2/32
+        PostUp = ip -4 rule add from $LAN lookup main
+        PostDown = ip -4 rule delete from $LAN lookup main
         DNS = 1.1.1.1
         MTU = 1280
 
@@ -31,31 +29,16 @@ runs:
         EOF
         sudo sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
 
-        connected=0
         for attempt in $(seq 1 8); do
-          sudo ip netns exec warp wg-quick down warp 2>/dev/null || true
-          sudo ip netns exec warp wg-quick up warp
-          for i in $(seq 1 15); do
-            if sudo ip netns exec warp wg show warp latest-handshakes 2>/dev/null | grep -qE '[1-9][0-9]*'; then
-              connected=1
-              break
-            fi
-            sleep 1
-          done
-          [ "$connected" -eq 1 ] && break
+          sudo wg-quick down warp 2>/dev/null || true
+          sudo wg-quick up warp && break
           sleep $((attempt * 2))
         done
-        [ "$connected" -eq 1 ] || { echo "WARP connect failed"; exit 1; }
+        sudo wg show warp latest-handshakes | grep -qE '[1-9][0-9]*' || { echo "WARP connect failed"; exit 1; }
 
-        sleep 2
-        echo "WARP IP: $(sudo ip netns exec warp curl -4 -sf --connect-timeout 8 https://cloudflare.com/cdn-cgi/trace | grep '^ip=' | cut -d= -f2)"
+        echo "IP: $(curl -4 -sf --connect-timeout 8 https://cloudflare.com/cdn-cgi/trace | grep '^ip=' | cut -d= -f2)"
 
-        printf '%s\n' \
-          '#!/bin/bash' \
-          'set -e' \
-          'ip netns exec warp wg-quick down warp 2>/dev/null || true' \
-          'sleep 2' \
-          'ip netns exec warp wg-quick up warp' \
-          'sleep 3' \
+        printf '%s\n' '#!/bin/bash' 'set -e' \
+          'wg-quick down warp 2>/dev/null || true' 'sleep 2' 'wg-quick up warp' 'sleep 3' \
           | sudo tee /usr/local/bin/warp-rotate >/dev/null
         sudo chmod +x /usr/local/bin/warp-rotate
