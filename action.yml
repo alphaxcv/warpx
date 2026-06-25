@@ -1,5 +1,5 @@
 name: Setup WARP
-description: Global WARP + GitHub bypass (live logs) + warp-rotate
+description: WARP in network namespace (global for renew, runner logs unaffected) + warp-rotate
 
 runs:
   using: composite
@@ -8,49 +8,54 @@ runs:
       run: |
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
-        GITHUB="github.com api.github.com actions.githubusercontent.com githubassets.com pipelines.actions.githubusercontent.com vstoken.actions.githubusercontent.com objects.githubusercontent.com codeload.github.com results-receiver.actions.githubusercontent.com"
 
-        warp() { sudo warp-cli --accept-tos "$@" >/dev/null; }
-        github_bypass() {
-          for h in $GITHUB; do warp tunnel host add "$h" 2>/dev/null || true; done
-        }
-
-        echo "[1/3] Install cloudflare-warp"
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         sudo apt-get update -qq
-        sudo NEEDRESTART_SUSPEND=1 apt-get install -y cloudflare-warp
-        sudo systemctl enable --now warp-svc
-        sleep 3
+        sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
 
-        echo "[2/3] Global WARP (GitHub bypassed for live logs)"
-        warp registration new
-        warp mode warp
-        github_bypass
-        warp connect
-        sleep 3
-        echo "Exit IP: $(curl -sf --connect-timeout 5 https://api.ipify.org || echo unknown)"
-        curl -sf --connect-timeout 5 https://cloudflare.com/cdn-cgi/trace | grep -E '^(warp|ip)=' || true
+        sudo ip netns add warp 2>/dev/null || true
+        sudo ip netns exec warp ip link set lo up
+        sudo mkdir -p /etc/netns/warp
+        echo "nameserver 1.1.1.1" | sudo tee /etc/netns/warp/resolv.conf >/dev/null
 
-        echo "[3/3] Install warp-rotate"
+        sudo tee /etc/wireguard/warp.conf >/dev/null <<'EOF'
+        [Interface]
+        PrivateKey = cKE7LmCF61IhqqABGhvJ44jWXp8fKymcMAEVAzbDF2k=
+        Address = 172.16.0.2/32
+        DNS = 1.1.1.1
+        MTU = 1280
+
+        [Peer]
+        PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+        AllowedIPs = 0.0.0.0/0
+        Endpoint = engage.cloudflareclient.com:2408
+        EOF
+        sudo sed -i 's/^[ ]\+//g' /etc/wireguard/warp.conf
+
+        connected=0
+        for attempt in $(seq 1 8); do
+          sudo ip netns exec warp wg-quick down warp 2>/dev/null || true
+          sudo ip netns exec warp wg-quick up warp
+          for i in $(seq 1 15); do
+            if sudo ip netns exec warp wg show warp latest-handshakes 2>/dev/null | grep -qE '[1-9][0-9]*'; then
+              connected=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$connected" -eq 1 ] && break
+          sleep $((attempt * 2))
+        done
+        [ "$connected" -eq 1 ] || { echo "WARP connect failed"; exit 1; }
+
+        sleep 2
+        echo "WARP IP: $(sudo ip netns exec warp curl -4 -sf --connect-timeout 8 https://cloudflare.com/cdn-cgi/trace | grep '^ip=' | cut -d= -f2)"
+
         printf '%s\n' \
           '#!/bin/bash' \
           'set -e' \
-          'GITHUB="github.com api.github.com actions.githubusercontent.com githubassets.com pipelines.actions.githubusercontent.com vstoken.actions.githubusercontent.com objects.githubusercontent.com codeload.github.com results-receiver.actions.githubusercontent.com"' \
-          'echo "Rotating WARP IP..."' \
-          'sudo warp-cli --accept-tos disconnect >/dev/null' \
-          'sleep 1' \
-          'sudo warp-cli --accept-tos registration delete || true' \
-          'sleep 1' \
-          'sudo warp-cli --accept-tos registration new >/dev/null' \
-          'sudo warp-cli --accept-tos mode warp >/dev/null' \
-          'for h in $GITHUB; do sudo warp-cli --accept-tos tunnel host add "$h" >/dev/null 2>&1 || true; done' \
-          'sudo warp-cli --accept-tos connect >/dev/null' \
+          'ip netns exec warp wg-quick down warp 2>/dev/null || true' \
+          'sleep 2' \
+          'ip netns exec warp wg-quick up warp' \
           'sleep 3' \
-          'echo -n "New IP: "' \
-          'curl -sf --connect-timeout 5 https://api.ipify.org || echo unknown' \
           | sudo tee /usr/local/bin/warp-rotate >/dev/null
         sudo chmod +x /usr/local/bin/warp-rotate
-        echo "Done."
