@@ -20,12 +20,6 @@ runs:
         sudo chmod +x /usr/local/bin/wgcf
         sudo mkdir -p /var/lib/wgcf
 
-        # ---- 生成全局模式 wg 配置 ----
-        # 关键点：AllowedIPs = 0.0.0.0/0（和/或 ::/0）让 WARP 接管全部出站流量，
-        # 但通过 PostUp/PostDown 加一条 ip rule，让"从 runner 自身 LAN 出口 IP 发出"
-        # 的流量（GitHub Actions 自己的心跳/日志上报走的就是这个源地址）继续走 main
-        # 路由表（即原始网卡），不经过 WARP。这样业务流量全局走 WARP，
-        # 但 Actions 跟 GitHub 服务器的日志通道不受影响、不会卡死。
         sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
         STACK="${1:-dual}"
@@ -64,15 +58,12 @@ runs:
         [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
         wg-quick down warp >/dev/null 2>&1 || true
 
-        # 清理设备身份，确保每次是"全新设备"重新注册
         rm -f "\$D/wgcf-account.toml" "\$D/wgcf-identity.json" "\$D"/wgcf-profile.conf
 
         cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
         warp-wg-build "\$STACK" || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
         wg-quick up warp >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
 
-        # 全局模式下 curl 默认走 WARP（因为 0.0.0.0/0 已接管），
-        # 用它验证隧道本身是否真的握手成功并出网
         for _ in \$(seq 1 8); do
           curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$' && exit 0
           sleep 1
@@ -92,6 +83,3 @@ runs:
         echo "WARP is up (global mode). GitHub Actions logging still goes via LAN bypass rule."
         echo "IPv4 (via WARP): $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
         echo "IPv6 (via WARP): $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
-        echo
-        echo "提示：全局模式下，Selenium/SeleniumBase 不需要再单独配置 --proxy-server，"
-        echo "Chrome 默认网络流量会自动走 WARP 隧道出网。"
