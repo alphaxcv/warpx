@@ -1,8 +1,8 @@
 name: Setup WARP
-description: Official cloudflare-warp client, global mode (warp-cli mode warp) + split-tunnel exclude GitHub's api/web/git/hooks IP ranges (auto-fetched from api.github.com/meta) so Actions logging/heartbeat stays direct, with identity rotation on each call
+description: Official cloudflare-warp client, global mode (warp-cli mode warp) + system-level ip rule split-tunnel for GitHub's api/web/git/hooks IP ranges (auto-fetched from api.github.com/meta), so Actions logging/heartbeat stays on the direct route regardless of warp-cli's own split-tunnel command support. Identity rotated on each call.
 inputs:
   stack:
-    description: "currently informational only; warp-cli does not expose a v4/v6-only mode switch the way wgcf did"
+    description: "currently informational only; warp-cli does not expose a v4/v6-only mode switch"
     required: false
     default: dual
 runs:
@@ -13,9 +13,8 @@ runs:
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
 
-        # ---- 安装官方 cloudflare-warp 客户端 ----
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends curl gnupg lsb-release jq
+        sudo apt-get install -y --no-install-recommends curl gnupg lsb-release jq iproute2
 
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
           | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -28,7 +27,6 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
 
-        # GitHub Actions runner 里没有用户级 systemd session，手动起 daemon
         sudo nohup warp-svc >/tmp/warp-svc.log 2>&1 &
         sleep 3
 
@@ -38,7 +36,6 @@ runs:
         OUT="${1:-/var/lib/cloudflare-warp/github-cidrs.txt}"
         sudo mkdir -p "$(dirname "$OUT")"
         META=$(curl -fsSL https://api.github.com/meta)
-        # 只取 IPv4 段（add-excluded-route 对 IPv6 CIDR 处理不一致，且 GHA 多数走 v4 出网）
         echo "$META" | jq -r '
           (.api // []), (.web // []), (.git // []), (.hooks // [])
           | .[]
@@ -47,35 +44,50 @@ runs:
         F
         sudo chmod +x /usr/local/bin/warp-fetch-github-cidrs
 
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
+        sudo tee /usr/local/bin/warp-apply-github-bypass >/dev/null <<'A'
         #!/bin/bash
         set -e
         GH_CIDRS=/var/lib/cloudflare-warp/github-cidrs.txt
+        TABLE=200
+        PREF=100
 
+        while ip rule show | grep -q "pref ${PREF} "; do
+          R=$(ip rule show | grep "pref ${PREF} " | head -n1 | sed -E 's/^([0-9]+):.*/\1/')
+          ip rule delete pref "$R" 2>/dev/null || break
+        done
+        ip route flush table "$TABLE" 2>/dev/null || true
+
+        [ -f "$GH_CIDRS" ] || { echo "[warp-apply-github-bypass] warn: $GH_CIDRS missing, skip" >&2; exit 0; }
+
+        while read -r cidr; do
+          [ -z "$cidr" ] && continue
+          ip rule add to "$cidr" table main pref "$PREF" 2>/dev/null || \
+            echo "[warp-apply-github-bypass] warn: failed to add rule for $cidr" >&2
+        done < "$GH_CIDRS"
+
+        echo "[warp-apply-github-bypass] applied $(wc -l < "$GH_CIDRS") ip rules (pref $PREF -> main table)" >&2
+        A
+        sudo chmod +x /usr/local/bin/warp-apply-github-bypass
+
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
+        #!/bin/bash
+        set -e
         warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
         warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
 
         warp-cli --accept-tos registration new >/dev/null 2>&1
 
         warp-cli --accept-tos mode warp >/dev/null 2>&1
-
-        if [ -f "\$GH_CIDRS" ]; then
-          while read -r cidr; do
-            [ -z "\$cidr" ] && continue
-            warp-cli --accept-tos add-excluded-route "\$cidr" >/dev/null 2>&1 || \
-              echo "[warp-rotate] warn: failed to exclude \$cidr (add-excluded-route may be unsupported on this client version)" >&2
-          done < "\$GH_CIDRS"
-        else
-          echo "[warp-rotate] warn: \$GH_CIDRS not found, GitHub traffic will NOT be excluded" >&2
-        fi
-
         warp-cli --accept-tos connect >/dev/null 2>&1
 
         for _ in \$(seq 1 10); do
-          curl -s --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$' && exit 0
+          curl -s --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$' && break
           sleep 1
         done
-        exit 1
+
+        warp-apply-github-bypass
+
+        curl -s --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$'
         R
         sudo chmod +x /usr/local/bin/warp-rotate
 
@@ -89,5 +101,5 @@ runs:
         [ "$ok" -eq 1 ] || { echo "WARP failed"; cat /tmp/warp-svc.log; exit 1; }
 
         echo "WARP is up (global mode via warp-cli)."
-        echo "GitHub IP ranges excluded from tunnel -- Actions logging stays on the direct route."
+        echo "GitHub IP ranges bypassed via system-level ip rule -- Actions logging stays on the direct route."
         echo "Exit IP (via WARP): $(curl -s --connect-timeout 5 https://api.ipify.org || echo N/A)"
