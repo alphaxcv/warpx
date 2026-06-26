@@ -20,10 +20,12 @@ runs:
         echo "::group::1. Install Dependencies & WARP"
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends curl gpg iproute2 iptables
+        
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
           | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
           | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
         
@@ -50,14 +52,24 @@ runs:
         sudo ip -n $NS link set lo up
         sudo ip -n $NS route add default via 10.200.200.1
         
-        # 在宿主机开启 NAT 转发，让 netns 可以访问外网以连接 Cloudflare 节点
+        # 开启 NAT 转发 (关键修复点：确保 FORWARD 链放行)
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-        HOST_IF=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
+        HOST_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
         sudo iptables -t nat -A POSTROUTING -o $HOST_IF -j MASQUERADE
+        sudo iptables -I FORWARD -i veth-host -j ACCEPT
+        sudo iptables -I FORWARD -o veth-host -j ACCEPT
         
         # 为 netns 配置独立 DNS
         sudo mkdir -p /etc/netns/$NS
         echo "nameserver 1.1.1.1" | sudo tee /etc/netns/$NS/resolv.conf >/dev/null
+        
+        # 测试 Netns 是否具备上网能力
+        echo "Testing Netns Internet Connectivity..."
+        if ! sudo ip netns exec $NS curl -s -I --connect-timeout 5 https://api.cloudflareclient.com > /dev/null; then
+            echo "❌ ERROR: Netns cannot reach the internet. NAT routing failed."
+            exit 1
+        fi
+        echo "✅ Netns Internet OK"
         echo "::endgroup::"
 
         echo "::group::3. Initialize WARP inside Netns"
@@ -65,17 +77,29 @@ runs:
         sudo ip netns exec $NS warp-svc > /tmp/warp-svc.log 2>&1 &
         sleep 3 # 等待守护进程初始化
         
-        # 定义快捷变量，所有 warp-cli 操作都在 netns 内执行
-        W="sudo ip netns exec $NS warp-cli --accept-tos"
+        # 检查守护进程是否存活
+        if ! pgrep -f warp-svc > /dev/null; then
+            echo "❌ ERROR: warp-svc crashed!"
+            cat /tmp/warp-svc.log
+            exit 1
+        fi
+
+        # 定义快捷变量，加上 timeout 防止命令卡死
+        W="sudo ip netns exec $NS timeout 15 warp-cli --accept-tos"
 
         connect() {
-          $W registration new >/dev/null 2>&1 || true
-          $W mode warp >/dev/null 2>&1
+          echo "Registering WARP..."
+          $W registration new || return 1
+          $W mode warp || return 1
+          
           case "$STACK" in
-            ipv4) $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
-            ipv6) $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
+            ipv4) $W tunnel ip add-range ::0/0 || return 1 ;;
+            ipv6) $W tunnel ip add-range 0.0.0.0/0 || return 1 ;;
           esac
-          $W connect >/dev/null 2>&1
+          
+          echo "Connecting WARP..."
+          $W connect || return 1
+          
           for _ in $(seq 1 30); do
             $W status 2>/dev/null | grep -q Connected && return 0
             sleep 1
@@ -84,10 +108,22 @@ runs:
         }
 
         for i in $(seq 1 5); do
+          echo "Attempt $i to connect WARP..."
           $W disconnect >/dev/null 2>&1 || true
           $W registration delete >/dev/null 2>&1 || true
-          connect && break
-          [ "$i" -eq 5 ] && { echo "WARP connect failed"; exit 1; }
+          
+          if connect; then
+             echo "✅ WARP Connected Successfully!"
+             break
+          fi
+          
+          echo "Attempt $i failed, retrying..."
+          [ "$i" -eq 5 ] && { 
+              echo "❌ WARP connect failed after 5 attempts"; 
+              echo "--- warp-svc.log ---"
+              cat /tmp/warp-svc.log
+              exit 1; 
+          }
           sleep $((i * 2))
         done
         echo "::endgroup::"
@@ -102,13 +138,12 @@ runs:
         # 1. IP 刷新脚本 (warp-rotate)
         sudo tee /usr/local/bin/warp-rotate >/dev/null <<EOF
         #!/bin/bash
-        W="sudo ip netns exec $NS warp-cli --accept-tos"
-        STACK="$STACK"
+        W="sudo ip netns exec $NS timeout 15 warp-cli --accept-tos"
         \$W disconnect >/dev/null 2>&1 || true
         \$W registration delete >/dev/null 2>&1 || true
         \$W registration new >/dev/null 2>&1 || exit 1
         \$W mode warp >/dev/null 2>&1 || exit 1
-        case "\$STACK" in
+        case "$STACK" in
           ipv4) \$W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
           ipv6) \$W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
         esac
