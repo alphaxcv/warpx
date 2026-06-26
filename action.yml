@@ -1,11 +1,5 @@
-name: Setup WARP (Netns Isolated)
-description: "High-performance isolated WARP runner"
-
-inputs:
-  stack:
-    description: "ipv4, ipv6, or dual"
-    required: false
-    default: dual
+name: Setup WARP (Portable Isolated)
+description: "Portable WARP isolation without system tampering"
 
 runs:
   using: composite
@@ -13,15 +7,12 @@ runs:
     - shell: bash
       run: |
         set -e
-        # 1. 安全安装 WARP (防止服务自动启动劫持 DNS)
-        echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-        sudo chmod +x /usr/sbin/policy-rc.d
+        # 1. 直接下载并解压 WARP，完全绕过 apt 库安装带来的副作用
+        wget -q https://pkg.cloudflareclient.com/pool/main/c/cloudflare-warp/cloudflare-warp_2024.1.285.0_amd64.deb
+        ar x cloudflare-warp_2024.1.285.0_amd64.deb data.tar.xz
+        tar -xf data.tar.xz
+        sudo cp usr/bin/warp-cli usr/bin/warp-svc /usr/local/bin/
         
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cloudflare-warp
-        sudo rm -f /usr/sbin/policy-rc.d
-
         # 2. 创建隔离网络空间 (Netns)
         sudo ip netns add warp_ns
         sudo ip link add veth-host type veth peer name veth-warp
@@ -35,29 +26,22 @@ runs:
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
         HOST_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
         sudo iptables -t nat -A POSTROUTING -o $HOST_IF -j MASQUERADE
-        sudo iptables -I FORWARD -i veth-host -j ACCEPT
-        sudo iptables -I FORWARD -o veth-host -j ACCEPT
         sudo mkdir -p /etc/netns/warp_ns && echo "nameserver 1.1.1.1" | sudo tee /etc/netns/warp_ns/resolv.conf >/dev/null
 
-        # 4. 在隔离环境中启动 WARP
-        sudo ip netns exec warp_ns warp-svc > /dev/null 2>&1 &
-        sleep 4
+        # 4. 启动守护进程 (以绝对路径)
+        sudo ip netns exec warp_ns /usr/local/bin/warp-svc > /dev/null 2>&1 &
+        sleep 5
         
-        # 5. 连接与配置
-        W="sudo ip netns exec warp_ns warp-cli --accept-tos"
-        $W registration new >/dev/null 2>&1 || true
-        $W mode warp >/dev/null 2>&1
-        [[ "${{ inputs.stack }}" == "ipv4" ]] && $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true
-        [[ "${{ inputs.stack }}" == "ipv6" ]] && $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true
-        $W connect >/dev/null 2>&1
-        
-        # 6. 生成便捷执行器
+        # 5. 生成执行器
         echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-exec >/dev/null
         echo 'sudo ip netns exec warp_ns "$@"' | sudo tee -a /usr/local/bin/warp-exec >/dev/null
         sudo chmod +x /usr/local/bin/warp-exec
-
-        # 7. 自动生成旋转器
-        echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-rotate >/dev/null
-        echo 'W="sudo ip netns exec warp_ns warp-cli --accept-tos"' | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
-        echo '$W disconnect >/dev/null 2>&1; $W registration delete >/dev/null 2>&1; $W registration new >/dev/null 2>&1; $W connect >/dev/null 2>&1' | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
-        sudo chmod +x /usr/local/bin/warp-rotate
+        
+        # 6. 连接 WARP
+        W="warp-exec /usr/local/bin/warp-cli --accept-tos"
+        $W registration new >/dev/null 2>&1 || true
+        $W mode warp >/dev/null 2>&1
+        $W connect >/dev/null 2>&1
+        
+        echo "WARP status:"
+        $W status || echo "WARP might be starting..."
