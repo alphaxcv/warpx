@@ -1,5 +1,5 @@
 name: Setup WARP
-description: warp-cli in netns (logs on host) + warp-rotate + warp-exec
+description: warp-cli in netns + warp-rotate + warp-exec
 
 inputs:
   stack:
@@ -25,62 +25,77 @@ runs:
           | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
+
+        # 禁止 warp-svc 在宿主机启动，避免改坏主机 DNS/路由
         sudo systemctl stop warp-svc 2>/dev/null || true
         sudo systemctl disable warp-svc 2>/dev/null || true
+        sudo systemctl mask warp-svc 2>/dev/null || true
+        sudo pkill -x warp-svc 2>/dev/null || true
 
         sudo ip netns del $NS 2>/dev/null || true
         sudo ip link del veth-host 2>/dev/null || true
         sudo ip netns add $NS
         sudo ip link add veth-host type veth peer name veth-warp
         sudo ip link set veth-warp netns $NS
-        sudo ip addr add 10.200.200.1/24 dev veth-host && sudo ip link set veth-host up
+        sudo ip addr add 10.200.200.1/24 dev veth-host
+        sudo ip link set veth-host up
         sudo ip -n $NS addr add 10.200.200.2/24 dev veth-warp
         sudo ip -n $NS link set veth-warp up
         sudo ip -n $NS link set lo up
         sudo ip -n $NS route add default via 10.200.200.1
-        sudo mkdir -p /etc/netns/$NS && echo nameserver 1.1.1.1 | sudo tee /etc/netns/$NS/resolv.conf >/dev/null
+        sudo mkdir -p /etc/netns/$NS
+        echo "nameserver 1.1.1.1" | sudo tee /etc/netns/$NS/resolv.conf >/dev/null
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
         HOST_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
-        sudo iptables -t nat -A POSTROUTING -s 10.200.200.0/24 -o $HOST_IF -j MASQUERADE
+        sudo iptables -t nat -C POSTROUTING -s 10.200.200.0/24 -o "$HOST_IF" -j MASQUERADE 2>/dev/null \
+          || sudo iptables -t nat -A POSTROUTING -s 10.200.200.0/24 -o "$HOST_IF" -j MASQUERADE
         sudo iptables -C FORWARD -i veth-host -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i veth-host -j ACCEPT
         sudo iptables -C FORWARD -o veth-host -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -o veth-host -j ACCEPT
 
         sudo ip netns exec $NS warp-svc >/dev/null 2>&1 &
         sleep 3
 
-        sudo tee /usr/local/bin/warp-connect >/dev/null <<EOF
+        sudo tee /usr/local/bin/warp-connect >/dev/null <<'EOF'
         #!/bin/bash
-        NS=$NS
-        STACK="$STACK"
-        W=(ip netns exec "\$NS" warp-cli --accept-tos)
-        "\${W[@]}" registration new >/dev/null 2>&1 || exit 1
-        "\${W[@]}" mode warp >/dev/null 2>&1 || exit 1
-        case "\$STACK" in
-          ipv4) "\${W[@]}" tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
-          ipv6) "\${W[@]}" tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
+        NS=warp_ns
+        STACK="__STACK__"
+        ns() { ip netns exec "$NS" warp-cli --accept-tos "$@"; }
+        ns registration new >/dev/null 2>&1 || exit 1
+        ns mode warp >/dev/null 2>&1 || exit 1
+        case "$STACK" in
+          ipv4) ns tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
+          ipv6) ns tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
         esac
-        "\${W[@]}" connect >/dev/null 2>&1 || exit 1
-        for _ in \$(seq 1 30); do
-          "\${W[@]}" status 2>/dev/null | grep -q Connected && exit 0
+        ns connect >/dev/null 2>&1 || exit 1
+        for _ in $(seq 1 30); do
+          ns status 2>/dev/null | grep -q Connected && exit 0
           sleep 1
         done
         exit 1
         EOF
+        sudo sed -i "s/__STACK__/$STACK/" /usr/local/bin/warp-connect
 
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<EOF
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'EOF'
         #!/bin/bash
-        W=(ip netns exec $NS warp-cli --accept-tos)
-        "\${W[@]}" disconnect >/dev/null 2>&1 || true
-        "\${W[@]}" registration delete >/dev/null 2>&1 || true
+        ns() { ip netns exec warp_ns warp-cli --accept-tos "$@"; }
+        ns disconnect >/dev/null 2>&1 || true
+        ns registration delete >/dev/null 2>&1 || true
         exec /usr/local/bin/warp-connect
         EOF
 
-        echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-exec >/dev/null
-        echo 'exec sudo ip netns exec '"$NS"' "$@"' | sudo tee -a /usr/local/bin/warp-exec >/dev/null
+        sudo tee /usr/local/bin/warp-exec >/dev/null <<'EOF'
+        #!/bin/bash
+        exec sudo ip netns exec warp_ns "$@"
+        EOF
+
         sudo chmod +x /usr/local/bin/warp-connect /usr/local/bin/warp-rotate /usr/local/bin/warp-exec
 
         ok=0
-        for i in $(seq 1 5); do sudo warp-rotate && ok=1 && break; sleep $((i * 2)); done
+        for i in $(seq 1 5); do
+          sudo warp-rotate && ok=1 && break
+          sleep $((i * 2))
+        done
         [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
 
-        echo "WARP IP: $(sudo ip netns exec $NS curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
+        echo "IPv4: $(sudo ip netns exec $NS curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
+        echo "IPv6: $(sudo ip netns exec $NS curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
