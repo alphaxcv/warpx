@@ -1,146 +1,106 @@
-name: 'Warp CLI Runner'
-description: '安装并连接 Cloudflare Warp，可切换IP，运行 sh/py 文件并输出实时日志'
-author: 'you'
-
+name: Setup WARP
+description: WireGuard global + ip rule from LAN + wgcf rotate (random endpoint pool)
 inputs:
-  script:
-    description: '要运行的脚本文件路径 (.sh 或 .py)'
+  stack:
+    description: "ipv4, ipv6, or dual"
     required: false
-    default: ''
-  command:
-    description: '直接运行的命令（与 script 二选一）'
-    required: false
-    default: ''
-  switch_ip:
-    description: '是否在运行前切换一次IP (true/false)'
-    required: false
-    default: 'true'
-  python_version:
-    description: 'Python 版本'
-    required: false
-    default: '3.11'
-
-outputs:
-  warp_ip:
-    description: '当前 Warp 出口 IP'
-    value: ${{ steps.warpinfo.outputs.ip }}
-
+    default: dual
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    # ---------- 1. 安装 Python（如果需要） ----------
-    - name: Setup Python
-      if: ${{ endsWith(inputs.script, '.py') }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ inputs.python_version }}
-
-    # ---------- 2. 安装 warp-cli ----------
-    - name: Install Cloudflare Warp
-      shell: bash
+    - shell: bash
       run: |
         set -e
-        echo "::group::安装 Cloudflare Warp"
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-        sudo apt-get update
-        sudo apt-get install -y cloudflare-warp
-        echo "::endgroup::"
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+        STACK="${{ inputs.stack }}"
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
+        curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
+          | sudo tee /usr/local/bin/wgcf >/dev/null
+        sudo chmod +x /usr/local/bin/wgcf
+        sudo mkdir -p /var/lib/wgcf
 
-    # ---------- 3. 注册并连接 ----------
-    - name: Connect Warp
-      shell: bash
-      run: |
-        set -e
-        echo "::group::连接 Warp"
-        # 启动守护进程
-        sudo systemctl enable --now warp-svc || sudo warp-svc &>/dev/null &
-        sleep 5
-
-        # 注册（如果还没注册）
-        warp-cli --accept-tos registration new || true
-        sleep 2
-
-        # 设置为代理/全局模式（warp 表示全局 wireguard）
-        warp-cli --accept-tos mode warp || true
-
-        # 连接
-        warp-cli --accept-tos connect
-        sleep 5
-
-        echo "连接状态："
-        warp-cli --accept-tos status || true
-        echo "::endgroup::"
-
-    # ---------- 4. 可选：切换IP ----------
-    - name: Switch IP
-      if: ${{ inputs.switch_ip == 'true' }}
-      shell: bash
-      run: |
-        echo "::group::切换 IP"
-        echo "断开重连以切换出口 IP..."
-        warp-cli --accept-tos disconnect
-        sleep 3
-        # 重新注册可以获得新身份（从而新 IP）
-        warp-cli --accept-tos registration delete || true
-        sleep 2
-        warp-cli --accept-tos registration new || true
-        sleep 2
-        warp-cli --accept-tos mode warp || true
-        warp-cli --accept-tos connect
-        sleep 6
-        warp-cli --accept-tos status || true
-        echo "::endgroup::"
-
-    # ---------- 5. 显示当前 IP ----------
-    - name: Show Warp IP
-      id: warpinfo
-      shell: bash
-      run: |
-        echo "::group::当前出口 IP 信息"
-        IP=$(curl -s --max-time 15 https://api.ipify.org || echo "unknown")
-        echo "出口 IP: $IP"
-        echo "ip=$IP" >> "$GITHUB_OUTPUT"
-        echo "Cloudflare Trace:"
-        curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace/ || true
-        echo "::endgroup::"
-
-    # ---------- 6. 运行脚本（实时日志） ----------
-    - name: Run Script (realtime log)
-      shell: bash
-      run: |
-        set -o pipefail
-        echo "::group::运行任务"
-
-        run_file() {
-          local f="\$1"
-          case "$f" in
-            *.py)
-              echo ">>> 运行 Python: $f"
-              # -u 关闭缓冲，stdbuf 强制行缓冲 -> 实时日志
-              stdbuf -oL -eL python -u "$f" 2>&1
-              ;;
-            *.sh)
-              echo ">>> 运行 Shell: $f"
-              chmod +x "$f" || true
-              stdbuf -oL -eL bash "$f" 2>&1
-              ;;
-            *)
-              echo "不支持的文件类型: $f"; exit 1
-              ;;
-          esac
-        }
-
-        if [ -n "${{ inputs.script }}" ]; then
-          run_file "${{ inputs.script }}"
-        elif [ -n "${{ inputs.command }}" ]; then
-          echo ">>> 运行命令: ${{ inputs.command }}"
-          stdbuf -oL -eL bash -c "${{ inputs.command }}" 2>&1
+        # ---- 随机 endpoint 池：IPv4 段 + IPv6 段 + 常见端口 ----
+        # 注意：这些都是 Cloudflare Anycast 入口，实际落到哪个 PoP 由
+        # Cloudflare 网络层决定，换 IP 不保证一定换"真实出口"，
+        # 但配合换端口 + 清理设备身份，能提升一部分概率。
+        sudo tee /usr/local/bin/warp-endpoint-pick >/dev/null <<'E'
+        #!/bin/bash
+        # 用法: warp-endpoint-pick v4|v6
+        FAMILY="${1:-v4}"
+        PORTS=(2408 500 1701 4500 4443 8095 8886)
+        PORT=${PORTS[$RANDOM % ${#PORTS[@]}]}
+        if [ "$FAMILY" = "v6" ]; then
+          # 2606:4700:d0::/48 段内随机最后一组
+          SUF=$(printf '%x' $((RANDOM % 65535)))
+          echo "[2606:4700:d0::a29f:${SUF}]:${PORT}"
         else
-          echo "未提供 script 或 command"
-          exit 1
+          # 162.159.192.0/24 与 162.159.193.0/24 轮换
+          OCT3=$((192 + RANDOM % 2))
+          OCT4=$((1 + RANDOM % 254))
+          echo "162.159.${OCT3}.${OCT4}:${PORT}"
+        fi
+        E
+        sudo chmod +x /usr/local/bin/warp-endpoint-pick
+
+        sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
+        #!/bin/bash
+        STACK="${1:-dual}"
+        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        cd /var/lib/wgcf && wgcf generate >/dev/null 2>&1
+        cp wgcf-profile.conf /etc/wireguard/warp.conf
+        sed -i '/^DNS/d;/PostUp/d;/PostDown/d;/^Endpoint/d' /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a DNS = off" /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
+        grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
+
+        if [ "$STACK" = "ipv4" ]; then
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
+          EP=$(warp-endpoint-pick v4)
+        elif [ "$STACK" = "ipv6" ]; then
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
+          EP=$(warp-endpoint-pick v6)
+        else
+          # dual: 随机选 v4 或 v6 endpoint 接入（AllowedIPs 仍是双栈）
+          if (( RANDOM % 2 )); then EP=$(warp-endpoint-pick v4); else EP=$(warp-endpoint-pick v6); fi
         fi
 
-        echo "::endgroup::"
+        echo "Endpoint = ${EP}" >> /etc/wireguard/warp.conf
+        echo "[warp-wg-build] using endpoint: ${EP}" >&2
+        B
+        sudo chmod +x /usr/local/bin/warp-wg-build
+
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<R
+        #!/bin/bash
+        STACK="$STACK"
+        D=/var/lib/wgcf
+        [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
+        wg-quick down warp >/dev/null 2>&1 || true
+
+        # 彻底清理设备身份，确保下次注册是"全新设备"，
+        # 不止删 account.toml，把 wgcf 可能留下的缓存/identity 一起清
+        rm -f "\$D/wgcf-account.toml" "\$D/wgcf-identity.json" "\$D"/wgcf-profile.conf
+
+        cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+        warp-wg-build "\$STACK" || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+        wg-quick up warp >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
+
+        for _ in \$(seq 1 8); do
+          curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$' && exit 0
+          sleep 1
+        done
+        [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
+        exit 1
+        R
+        sudo chmod +x /usr/local/bin/warp-rotate
+
+        ok=0
+        for i in $(seq 1 5); do
+          sudo warp-rotate "$STACK" && ok=1 && break
+          # 随机 jitter，避免在同一时间窗口反复打同一个边缘节点
+          sleep $((RANDOM % 8 + i * 2))
+        done
+        [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
+        echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
+        echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
