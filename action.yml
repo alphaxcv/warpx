@@ -25,22 +25,30 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
 
-        # WARP 只在 netns 里，主网络不动 → 日志实时
+        # netns + veth（文档: ip-route(8) / fuad-daoud gist）
         sudo ip netns add warp 2>/dev/null || true
         sudo ip link del vh0 2>/dev/null || true
         sudo ip link add vh0 type veth peer name vn0
         sudo ip link set vn0 netns warp
-        sudo ip addr add 10.200.1.1/24 dev vh0 && sudo ip link set vh0 up
+        sudo ip addr add 10.200.1.1/24 dev vh0
+        sudo ip link set vh0 up
         sudo ip netns exec warp ip addr add 10.200.1.2/24 dev vn0
-        sudo ip netns exec warp ip link set vn0 up lo up
+        sudo ip netns exec warp ip link set vn0 up
+        sudo ip netns exec warp ip link set lo up
         sudo ip netns exec warp ip route add default via 10.200.1.1
+        sudo mkdir -p /etc/netns/warp
+        echo "nameserver 1.1.1.1" | sudo tee /etc/netns/warp/resolv.conf >/dev/null
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
         sudo iptables -t nat -C POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null \
           || sudo iptables -t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE
 
+        # warp-svc 只在 netns 内运行（文档: systemd NetworkNamespacePath）
         sudo systemctl stop warp-svc 2>/dev/null || true
-        sudo pkill warp-svc 2>/dev/null || true
-        sudo ip netns exec warp warp-svc >/dev/null 2>&1 &
+        sudo mkdir -p /etc/systemd/system/warp-svc.service.d
+        printf '%s\n' '[Service]' 'NetworkNamespacePath=/var/run/netns/warp' 'PrivateNetwork=true' \
+          | sudo tee /etc/systemd/system/warp-svc.service.d/netns.conf >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now warp-svc
         sleep 3
 
         sudo tee /usr/local/bin/warp-rotate >/dev/null <<EOF
