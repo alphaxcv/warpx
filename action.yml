@@ -1,71 +1,66 @@
 name: Setup WARP
-description: warp-cli global + ip rule from LAN + registration rotate
-
-inputs:
-  stack:
-    description: "ipv4, ipv6, or dual"
-    required: false
-    default: dual
+description: Install Cloudflare warp-cli, connect in full-tunnel (global proxy) mode with real-time journal logs streamed to the job log, preserve the runner's own LAN route outside the tunnel, and provide a reusable warp-rotate command that gets a fresh IP and confirms the change. Single self-contained file -- no external script files needed, safe to vendor into any repo or reference via uses:.
 
 runs:
   using: composite
   steps:
-    - shell: bash
+    - name: Install warp-cli
+      shell: bash
       run: |
         set -e
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
-        STACK="${{ inputs.stack }}"
-
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends curl gpg iproute2
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
           | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
           | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
 
+    - name: Start warp-svc
+      shell: bash
+      run: |
+        set -e
         sudo systemctl enable --now warp-svc
         for _ in $(seq 1 30); do
           sudo warp-cli --accept-tos status >/dev/null 2>&1 && break
           sleep 1
         done
 
+    - name: Preserve LAN route outside the tunnel
+      shell: bash
+      run: |
+        set -e
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        echo "Runner LAN address: $LAN"
         sudo ip -4 rule add from "$LAN" lookup main 2>/dev/null || true
 
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<ROTATE
-        #!/bin/bash
-        W="warp-cli --accept-tos"
-        STACK="$STACK"
-        sudo journalctl -u warp-svc -f --no-pager -n 0 &
-        JP=\$!
-        trap 'sudo kill \$JP 2>/dev/null; wait \$JP 2>/dev/null || true' EXIT
-        sleep 0.3
-        \$W disconnect 2>/dev/null || true
-        \$W registration delete 2>/dev/null || true
-        \$W registration new
-        \$W mode warp
-        case "\$STACK" in
-          ipv4) \$W tunnel ip add-range ::0/0 2>/dev/null || true ;;
-          ipv6) \$W tunnel ip add-range 0.0.0.0/0 2>/dev/null || true ;;
-        esac
-        \$W connect
-        for _ in \$(seq 1 30); do
-          \$W status 2>/dev/null | grep -q Connected && exit 0
-          sleep 1
-        done
-        exit 1
-        ROTATE
-        sudo sed -i 's/^[ ]\+//g' /usr/local/bin/warp-rotate
-        sudo chmod +x /usr/local/bin/warp-rotate
+    - name: Install helper commands (decoded from base64, no external files)
+      shell: bash
+      run: |
+        set -e
+        echo IyEvYmluL2Jhc2gKIyBTdHJlYW0gd2FycC1zdmMgam91cm5hbCBsb2dzIHRvIHN0ZG91dCBpbiByZWFsIHRpbWUgd2hpbGUgYSBjb21tYW5kIHJ1bnMuCiMgVXNhZ2U6IHdhcnAtbGl2ZSAiPGdyb3VwIGxhYmVsPiIgPGNvbW1hbmQ+IFthcmdzLi4uXQojCiMgam91cm5hbGN0bCBzd2l0Y2hlcyBmcm9tIGxpbmUtYnVmZmVyZWQgdG8gYmxvY2stYnVmZmVyZWQgb3V0cHV0IHdoZW4KIyBzdGRvdXQgaXMgYSBwaXBlICh3aGljaCBpcyB3aGF0IEdpdEh1YiBBY3Rpb25zIGdpdmVzIHlvdSkgaW5zdGVhZCBvZiBhCiMgVFRZLiBXaXRob3V0IHN0ZGJ1ZiAtb0wsIGxvZyBsaW5lcyBnZXQgaGVsZCBpbiBhIGJ1ZmZlciBhbmQgb25seSBmbHVzaAojIG91dCBpbiBvbmUgYmlnIGNodW5rIGF0IHRoZSBlbmQgLS0gdGhhdCdzIHdoYXQgbG9va3MgbGlrZSAibm8gcmVhbC10aW1lCiMgbG9ncyIgZXZlbiB0aG91Z2ggam91cm5hbGN0bCBpcyBhY3R1YWxseSBydW5uaW5nIHRoZSB3aG9sZSB0aW1lLgpzZXQgLWUKbGFiZWw9IiQxIjsgc2hpZnQKCmVjaG8gIjo6Z3JvdXA6OiR7bGFiZWx9IgpzdWRvIHN0ZGJ1ZiAtb0wgLWVMIGpvdXJuYWxjdGwgLXUgd2FycC1zdmMgLWYgLS1uby1wYWdlciAtbiAwICYKdGFpbF9waWQ9JCEKZGlzb3duICIkdGFpbF9waWQiIDI+L2Rldi9udWxsIHx8IHRydWUKCnN0ZGJ1ZiAtb0wgLWVMICIkQCIKcmM9JD8KCiMgR3JhY2UgcGVyaW9kIHNvIHRyYWlsaW5nIGxvZyBsaW5lcyBmbHVzaCBiZWZvcmUgd2UgY2xvc2UgdGhlIGdyb3VwLgpzbGVlcCAyCgojIERvIE5PVCBgd2FpdGAgb24gdGhpcyBQSUQ6IHN1ZG8gY2FuIGZvcmsgYW4gaW50ZXJuYWwgc2Vzc2lvbi1tYW5hZ2VtZW50CiMgcHJvY2VzcyByYXRoZXIgdGhhbiBleGVjIHN0cmFpZ2h0IGludG8gam91cm5hbGN0bCwgc28gdGhlIFBJRCBiYXNoIHNlZXMKIyB2aWEgYCQhYCBpcyBub3QgZ3VhcmFudGVlZCB0byBiZSBhIGRpcmVjdCBjaGlsZCBpdCBjYW4gd2FpdCgpIG9uIC0tIHRoYXQKIyBjYW4gYmxvY2sgZm9yZXZlci4gS2lsbCAoVEVSTSB0aGVuIEtJTEwgYXMgYSBmYWxsYmFjaykgYW5kIG1vdmUgb24KIyB3aXRob3V0IHdhaXRpbmcgZm9yIGl0IHRvIGFjdHVhbGx5IGV4aXQuCnN1ZG8ga2lsbCAiJHRhaWxfcGlkIiAyPi9kZXYvbnVsbCB8fCB0cnVlCnNsZWVwIDAuMwpzdWRvIGtpbGwgLTkgIiR0YWlsX3BpZCIgMj4vZGV2L251bGwgfHwgdHJ1ZQplY2hvICI6OmVuZGdyb3VwOjoiCmV4aXQgJHJjCg== | base64 -d | sudo tee /usr/local/bin/warp-live >/dev/null
+        echo IyEvYmluL2Jhc2gKIyBEaXNjb25uZWN0LCBkcm9wIHRoZSBjdXJyZW50IFdBUlAgaWRlbnRpdHksIHJlZ2lzdGVyIGEgZnJlc2ggb25lLCByZWNvbm5lY3QKIyBpbiBmdWxsLXR1bm5lbCBtb2RlLCBhbmQgY29uZmlybSB0aGUgcHVibGljIElQIGFjdHVhbGx5IGNoYW5nZWQuCiMgU2FmZSB0byBjYWxsIHJlcGVhdGVkbHkgZnJvbSBhbnkgbGF0ZXIgd29ya2Zsb3cgc3RlcC4Kc2V0IC1lCgpXPSJ3YXJwLWNsaSAtLWFjY2VwdC10b3MiCgpnZXRfaXAoKSB7CiAgY3VybCAtcyAtLW1heC10aW1lIDUgaHR0cHM6Ly93d3cuY2xvdWRmbGFyZS5jb20vY2RuLWNnaS90cmFjZSAyPi9kZXYvbnVsbCB8IGdyZXAgJ15pcD0nIHwgY3V0IC1kPSAtZjIKfQoKd2FpdF9jb25uZWN0ZWQoKSB7CiAgZm9yIF8gaW4gJChzZXEgMSAzMCk7IGRvCiAgICAkVyBzdGF0dXMgMj4vZGV2L251bGwgfCBncmVwIC1xIENvbm5lY3RlZCAmJiByZXR1cm4gMAogICAgc2xlZXAgMQogIGRvbmUKICBlY2hvICJUaW1lZCBvdXQgd2FpdGluZyBmb3IgQ29ubmVjdGVkIHN0YXR1cyIgPiYyCiAgcmV0dXJuIDEKfQoKcm90YXRlX29uY2UoKSB7CiAgJFcgZGlzY29ubmVjdCAyPi9kZXYvbnVsbCB8fCB0cnVlCiAgJFcgcmVnaXN0cmF0aW9uIGRlbGV0ZSAyPi9kZXYvbnVsbCB8fCB0cnVlCiAgJFcgcmVnaXN0cmF0aW9uIG5ldwogICRXIG1vZGUgd2FycAogICRXIGNvbm5lY3QKICB3YWl0X2Nvbm5lY3RlZAp9CgpleHBvcnQgLWYgZ2V0X2lwIHdhaXRfY29ubmVjdGVkIHJvdGF0ZV9vbmNlCmV4cG9ydCBXCgpvbGRfaXA9JChnZXRfaXApCmVjaG8gIkN1cnJlbnQgSVA6ICR7b2xkX2lwOi11bmtub3dufSIKCndhcnAtbGl2ZSAiUm90YXRlIFdBUlAgaWRlbnRpdHkiIHJvdGF0ZV9vbmNlCgpuZXdfaXA9JChnZXRfaXApCmVjaG8gIk5ldyBJUDogJHtuZXdfaXA6LXVua25vd259IgoKaWYgWyAtbiAiJG9sZF9pcCIgXSAmJiBbICIkb2xkX2lwIiA9ICIkbmV3X2lwIiBdOyB0aGVuCiAgZWNobyAiOjp3YXJuaW5nOjpJUCB1bmNoYW5nZWQgYWZ0ZXIgcm90YXRpb24gKCR7bmV3X2lwfSksIHJldHJ5aW5nIG9uY2UiCiAgd2FycC1saXZlICJSZXRyeSByb3RhdGUiIHJvdGF0ZV9vbmNlCiAgbmV3X2lwPSQoZ2V0X2lwKQogIGVjaG8gIk5ldyBJUCBhZnRlciByZXRyeTogJHtuZXdfaXA6LXVua25vd259IgpmaQoKZWNobyAiSVAgcm90YXRlZDogJHtvbGRfaXA6LT99IC0+ICR7bmV3X2lwOi0/fSIK | base64 -d | sudo tee /usr/local/bin/warp-rotate >/dev/null
+        sudo chmod +x /usr/local/bin/warp-live /usr/local/bin/warp-rotate
 
+    - name: Connect WARP (with retries)
+      shell: bash
+      run: |
+        set -e
         ok=0
         for i in $(seq 1 5); do
-          sudo warp-rotate && ok=1 && break
+          warp-rotate && ok=1 && break
           sleep $((i * 2))
         done
-        [ "$ok" -eq 1 ] || { echo "WARP connect failed"; exit 1; }
+        if [ "$ok" -ne 1 ]; then
+          echo "WARP connect failed"
+          exit 1
+        fi
 
+    - name: Show resulting IP
+      shell: bash
+      run: |
+        set -e
         echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
         echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
