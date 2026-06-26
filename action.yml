@@ -1,5 +1,11 @@
-name: Setup WARP (The Working Way)
-description: "Minimalist WARP setup"
+name: Setup WARP
+description: warp-cli in netns (logs on host) + warp-rotate + warp-exec
+
+inputs:
+  stack:
+    description: "ipv4, ipv6, or dual"
+    required: false
+    default: dual
 
 runs:
   using: composite
@@ -7,50 +13,74 @@ runs:
     - shell: bash
       run: |
         set -e
-        # 1. 禁用所有服务自启，防止 systemd 冲突
-        echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-        sudo chmod +x /usr/sbin/policy-rc.d
-        
-        # 2. 获取 WARP (通过官方 apt 源安装但不启动)
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        
+        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+        STACK="${{ inputs.stack }}"
+        NS=warp_ns
+
         sudo apt-get update -qq
-        # 仅下载并安装包，拒绝任何触发器
+        sudo apt-get install -y --no-install-recommends curl gpg iproute2 iptables
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
-        
-        # 3. 立即清理掉它试图注册的 systemd 服务，确保宿主机干净
-        sudo rm -f /usr/sbin/policy-rc.d
-        sudo systemctl stop warp-svc || true
-        sudo systemctl disable warp-svc || true
-        
-        # 4. 设置网络命名空间 (Netns)
-        sudo ip netns add warp_ns
+        sudo systemctl stop warp-svc 2>/dev/null || true
+        sudo systemctl disable warp-svc 2>/dev/null || true
+
+        sudo ip netns del $NS 2>/dev/null || true
+        sudo ip link del veth-host 2>/dev/null || true
+        sudo ip netns add $NS
         sudo ip link add veth-host type veth peer name veth-warp
-        sudo ip link set veth-warp netns warp_ns
+        sudo ip link set veth-warp netns $NS
         sudo ip addr add 10.200.200.1/24 dev veth-host && sudo ip link set veth-host up
-        sudo ip -n warp_ns addr add 10.200.200.2/24 dev veth-warp
-        sudo ip -n warp_ns link set veth-warp up && sudo ip -n warp_ns link set lo up
-        sudo ip -n warp_ns route add default via 10.200.200.1
-        
-        # 5. 开启 NAT
+        sudo ip -n $NS addr add 10.200.200.2/24 dev veth-warp
+        sudo ip -n $NS link set veth-warp up
+        sudo ip -n $NS link set lo up
+        sudo ip -n $NS route add default via 10.200.200.1
+        sudo mkdir -p /etc/netns/$NS && echo nameserver 1.1.1.1 | sudo tee /etc/netns/$NS/resolv.conf >/dev/null
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
         HOST_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
-        sudo iptables -t nat -A POSTROUTING -o $HOST_IF -j MASQUERADE
-        
-        # 6. 启动服务并配置
-        sudo ip netns exec warp_ns /usr/bin/warp-svc > /tmp/warp.log 2>&1 &
-        sleep 5
-        
-        # 7. 注册与连接 (注入变量跳过TOS)
-        export WARP_CLI_ACCEPT_TOS=1
-        sudo ip netns exec warp_ns warp-cli registration new >/dev/null 2>&1 || true
-        sudo ip netns exec warp_ns warp-cli mode warp >/dev/null 2>&1
-        sudo ip netns exec warp_ns warp-cli connect >/dev/null 2>&1
-        
-        # 8. 生成工具
+        sudo iptables -t nat -A POSTROUTING -s 10.200.200.0/24 -o $HOST_IF -j MASQUERADE
+        sudo iptables -C FORWARD -i veth-host -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i veth-host -j ACCEPT
+        sudo iptables -C FORWARD -o veth-host -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -o veth-host -j ACCEPT
+
+        sudo ip netns exec $NS warp-svc >/dev/null 2>&1 &
+        sleep 3
+
+        sudo tee /usr/local/bin/warp-connect >/dev/null <<EOF
+        #!/bin/bash
+        NS=$NS
+        STACK="$STACK"
+        W=(ip netns exec "\$NS" warp-cli --accept-tos)
+        "\${W[@]}" registration new >/dev/null 2>&1 || exit 1
+        "\${W[@]}" mode warp >/dev/null 2>&1 || exit 1
+        case "\$STACK" in
+          ipv4) "\${W[@]}" tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
+          ipv6) "\${W[@]}" tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
+        esac
+        "\${W[@]}" connect >/dev/null 2>&1 || exit 1
+        for _ in \$(seq 1 30); do
+          "\${W[@]}" status 2>/dev/null | grep -q Connected && exit 0
+          sleep 1
+        done
+        exit 1
+        EOF
+
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<EOF
+        #!/bin/bash
+        W=(ip netns exec $NS warp-cli --accept-tos)
+        "\${W[@]}" disconnect >/dev/null 2>&1 || true
+        "\${W[@]}" registration delete >/dev/null 2>&1 || true
+        exec /usr/local/bin/warp-connect
+        EOF
+
         echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-exec >/dev/null
-        echo 'sudo ip netns exec warp_ns "$@"' | sudo tee -a /usr/local/bin/warp-exec >/dev/null
-        sudo chmod +x /usr/local/bin/warp-exec
-        
-        echo "✅ Setup Complete"
+        echo 'exec sudo ip netns exec '"$NS"' "$@"' | sudo tee -a /usr/local/bin/warp-exec >/dev/null
+        sudo chmod +x /usr/local/bin/warp-connect /usr/local/bin/warp-rotate /usr/local/bin/warp-exec
+
+        ok=0
+        for i in $(seq 1 5); do sudo warp-rotate && ok=1 && break; sleep $((i * 2)); done
+        [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
+
+        echo "WARP IP: $(sudo ip netns exec $NS curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
