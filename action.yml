@@ -1,5 +1,5 @@
 name: Setup WARP (Netns Isolated)
-description: warp-cli mode warp + netns isolation + warp-rotate
+description: "High-performance isolated WARP runner"
 
 inputs:
   stack:
@@ -13,155 +13,51 @@ runs:
     - shell: bash
       run: |
         set -e
-        export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
-        STACK="${{ inputs.stack }}"
-        NS="warp_ns"
+        # 1. 安全安装 WARP (防止服务自动启动劫持 DNS)
+        echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+        sudo chmod +x /usr/sbin/policy-rc.d
+        
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cloudflare-warp
+        sudo rm -f /usr/sbin/policy-rc.d
 
-        echo "::group::1. Install Dependencies & WARP"
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends curl gpg iproute2 iptables
-        
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
-          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-        
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends cloudflare-warp
-        
-        # 停用宿主机默认启动的 warp-svc，避免与 netns 内的进程冲突
-        sudo systemctl stop warp-svc || true
-        sudo systemctl disable warp-svc || true
-        echo "::endgroup::"
-
-        echo "::group::2. Setup Network Namespace ($NS)"
-        # 创建命名空间
-        sudo ip netns add $NS
-        
-        # 创建 veth 接口对，打通宿主机与 netns
+        # 2. 创建隔离网络空间 (Netns)
+        sudo ip netns add warp_ns
         sudo ip link add veth-host type veth peer name veth-warp
-        sudo ip link set veth-warp netns $NS
+        sudo ip link set veth-warp netns warp_ns
+        sudo ip addr add 10.200.200.1/24 dev veth-host && sudo ip link set veth-host up
+        sudo ip -n warp_ns addr add 10.200.200.2/24 dev veth-warp
+        sudo ip -n warp_ns link set veth-warp up && sudo ip -n warp_ns link set lo up
+        sudo ip -n warp_ns route add default via 10.200.200.1
         
-        # 配置宿主机端 IP (10.200.200.1)
-        sudo ip addr add 10.200.200.1/24 dev veth-host
-        sudo ip link set veth-host up
-        
-        # 配置 Netns 端 IP (10.200.200.2) 及默认路由
-        sudo ip -n $NS addr add 10.200.200.2/24 dev veth-warp
-        sudo ip -n $NS link set veth-warp up
-        sudo ip -n $NS link set lo up
-        sudo ip -n $NS route add default via 10.200.200.1
-        
-        # 开启 NAT 转发 (关键修复点：确保 FORWARD 链放行)
+        # 3. 开启 NAT 转发
         sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
         HOST_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
         sudo iptables -t nat -A POSTROUTING -o $HOST_IF -j MASQUERADE
         sudo iptables -I FORWARD -i veth-host -j ACCEPT
         sudo iptables -I FORWARD -o veth-host -j ACCEPT
+        sudo mkdir -p /etc/netns/warp_ns && echo "nameserver 1.1.1.1" | sudo tee /etc/netns/warp_ns/resolv.conf >/dev/null
+
+        # 4. 在隔离环境中启动 WARP
+        sudo ip netns exec warp_ns warp-svc > /dev/null 2>&1 &
+        sleep 4
         
-        # 为 netns 配置独立 DNS
-        sudo mkdir -p /etc/netns/$NS
-        echo "nameserver 1.1.1.1" | sudo tee /etc/netns/$NS/resolv.conf >/dev/null
+        # 5. 连接与配置
+        W="sudo ip netns exec warp_ns warp-cli --accept-tos"
+        $W registration new >/dev/null 2>&1 || true
+        $W mode warp >/dev/null 2>&1
+        [[ "${{ inputs.stack }}" == "ipv4" ]] && $W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true
+        [[ "${{ inputs.stack }}" == "ipv6" ]] && $W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true
+        $W connect >/dev/null 2>&1
         
-        # 测试 Netns 是否具备上网能力
-        echo "Testing Netns Internet Connectivity..."
-        if ! sudo ip netns exec $NS curl -s -I --connect-timeout 5 https://api.cloudflareclient.com > /dev/null; then
-            echo "❌ ERROR: Netns cannot reach the internet. NAT routing failed."
-            exit 1
-        fi
-        echo "✅ Netns Internet OK"
-        echo "::endgroup::"
-
-        echo "::group::3. Initialize WARP inside Netns"
-        # 在 netns 内后台启动 warp 守护进程
-        sudo ip netns exec $NS warp-svc > /tmp/warp-svc.log 2>&1 &
-        sleep 3 # 等待守护进程初始化
-        
-        # 检查守护进程是否存活
-        if ! pgrep -f warp-svc > /dev/null; then
-            echo "❌ ERROR: warp-svc crashed!"
-            cat /tmp/warp-svc.log
-            exit 1
-        fi
-
-        # 定义快捷变量，加上 timeout 防止命令卡死
-        W="sudo ip netns exec $NS timeout 15 warp-cli --accept-tos"
-
-        connect() {
-          echo "Registering WARP..."
-          $W registration new || return 1
-          $W mode warp || return 1
-          
-          case "$STACK" in
-            ipv4) $W tunnel ip add-range ::0/0 || return 1 ;;
-            ipv6) $W tunnel ip add-range 0.0.0.0/0 || return 1 ;;
-          esac
-          
-          echo "Connecting WARP..."
-          $W connect || return 1
-          
-          for _ in $(seq 1 30); do
-            $W status 2>/dev/null | grep -q Connected && return 0
-            sleep 1
-          done
-          return 1
-        }
-
-        for i in $(seq 1 5); do
-          echo "Attempt $i to connect WARP..."
-          $W disconnect >/dev/null 2>&1 || true
-          $W registration delete >/dev/null 2>&1 || true
-          
-          if connect; then
-             echo "✅ WARP Connected Successfully!"
-             break
-          fi
-          
-          echo "Attempt $i failed, retrying..."
-          [ "$i" -eq 5 ] && { 
-              echo "❌ WARP connect failed after 5 attempts"; 
-              echo "--- warp-svc.log ---"
-              cat /tmp/warp-svc.log
-              exit 1; 
-          }
-          sleep $((i * 2))
-        done
-        echo "::endgroup::"
-
-        echo "::group::4. IP Verification"
-        echo "Host IPv4 (Bypass): $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
-        echo "WARP IPv4 (Netns): $(sudo ip netns exec $NS curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
-        echo "WARP IPv6 (Netns): $(sudo ip netns exec $NS curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
-        echo "::endgroup::"
-
-        echo "::group::5. Generate Helper Scripts"
-        # 1. IP 刷新脚本 (warp-rotate)
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<EOF
-        #!/bin/bash
-        W="sudo ip netns exec $NS timeout 15 warp-cli --accept-tos"
-        \$W disconnect >/dev/null 2>&1 || true
-        \$W registration delete >/dev/null 2>&1 || true
-        \$W registration new >/dev/null 2>&1 || exit 1
-        \$W mode warp >/dev/null 2>&1 || exit 1
-        case "$STACK" in
-          ipv4) \$W tunnel ip add-range ::0/0 >/dev/null 2>&1 || true ;;
-          ipv6) \$W tunnel ip add-range 0.0.0.0/0 >/dev/null 2>&1 || true ;;
-        esac
-        \$W connect >/dev/null 2>&1 || exit 1
-        for _ in \$(seq 1 30); do
-          \$W status 2>/dev/null | grep -q Connected && exit 0
-          sleep 1
-        done
-        exit 1
-        EOF
-        sudo sed -i 's/^[ ]\+//g' /usr/local/bin/warp-rotate
-        sudo chmod +x /usr/local/bin/warp-rotate
-
-        # 2. 隔离执行脚本 (warp-exec)
-        sudo tee /usr/local/bin/warp-exec >/dev/null <<EOF
-        #!/bin/bash
-        exec sudo ip netns exec $NS "\$@"
-        EOF
+        # 6. 生成便捷执行器
+        echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-exec >/dev/null
+        echo 'sudo ip netns exec warp_ns "$@"' | sudo tee -a /usr/local/bin/warp-exec >/dev/null
         sudo chmod +x /usr/local/bin/warp-exec
-        echo "Scripts installed: warp-rotate, warp-exec"
-        echo "::endgroup::"
+
+        # 7. 自动生成旋转器
+        echo '#!/bin/bash' | sudo tee /usr/local/bin/warp-rotate >/dev/null
+        echo 'W="sudo ip netns exec warp_ns warp-cli --accept-tos"' | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        echo '$W disconnect >/dev/null 2>&1; $W registration delete >/dev/null 2>&1; $W registration new >/dev/null 2>&1; $W connect >/dev/null 2>&1' | sudo tee -a /usr/local/bin/warp-rotate >/dev/null
+        sudo chmod +x /usr/local/bin/warp-rotate
