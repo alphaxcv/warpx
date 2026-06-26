@@ -40,11 +40,16 @@ runs:
         sudo ip netns exec warp_ns /usr/bin/warp-svc > /tmp/warp.log 2>&1 &
         sleep 5
         
-        # 7. 配置连接
-        W="sudo ip netns exec warp_ns warp-cli --accept-tos"
+        # 7. 配置连接 (注入环境变量强制通过 TOS)
+        W="sudo ip netns exec warp_ns WARP_CLI_ACCEPT_TOS=1 warp-cli"
+        
+        # 尝试注册，如果已经注册则忽略错误
         $W registration new >/dev/null 2>&1 || true
         $W mode warp >/dev/null 2>&1
         $W connect >/dev/null 2>&1
+        
+        # 给它 5 秒时间建立隧道
+        sleep 5
         
         # 8. 恢复 DNS 文件权限
         sudo chattr -i /etc/resolv.conf || true
