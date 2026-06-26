@@ -1,5 +1,5 @@
 name: Setup WARP
-description: WireGuard global + ip rule from LAN + wgcf rotate (random endpoint pool)
+description: WireGuard global mode (0.0.0.0/0 via WARP) + LAN bypass rule keeps GitHub Actions logging alive + identity rotation on each call
 inputs:
   stack:
     description: "ipv4, ipv6, or dual"
@@ -20,54 +20,40 @@ runs:
         sudo chmod +x /usr/local/bin/wgcf
         sudo mkdir -p /var/lib/wgcf
 
-        # ---- 随机 endpoint 池：IPv4 段 + IPv6 段 + 常见端口 ----
-        # 注意：这些都是 Cloudflare Anycast 入口，实际落到哪个 PoP 由
-        # Cloudflare 网络层决定，换 IP 不保证一定换"真实出口"，
-        # 但配合换端口 + 清理设备身份，能提升一部分概率。
-        sudo tee /usr/local/bin/warp-endpoint-pick >/dev/null <<'E'
-        #!/bin/bash
-        # 用法: warp-endpoint-pick v4|v6
-        FAMILY="${1:-v4}"
-        PORTS=(2408 500 1701 4500 4443 8095 8886)
-        PORT=${PORTS[$RANDOM % ${#PORTS[@]}]}
-        if [ "$FAMILY" = "v6" ]; then
-          # 2606:4700:d0::/48 段内随机最后一组
-          SUF=$(printf '%x' $((RANDOM % 65535)))
-          echo "[2606:4700:d0::a29f:${SUF}]:${PORT}"
-        else
-          # 162.159.192.0/24 与 162.159.193.0/24 轮换
-          OCT3=$((192 + RANDOM % 2))
-          OCT4=$((1 + RANDOM % 254))
-          echo "162.159.${OCT3}.${OCT4}:${PORT}"
-        fi
-        E
-        sudo chmod +x /usr/local/bin/warp-endpoint-pick
-
+        # ---- 生成全局模式 wg 配置 ----
+        # 关键点：AllowedIPs = 0.0.0.0/0（和/或 ::/0）让 WARP 接管全部出站流量，
+        # 但通过 PostUp/PostDown 加一条 ip rule，让"从 runner 自身 LAN 出口 IP 发出"
+        # 的流量（GitHub Actions 自己的心跳/日志上报走的就是这个源地址）继续走 main
+        # 路由表（即原始网卡），不经过 WARP。这样业务流量全局走 WARP，
+        # 但 Actions 跟 GitHub 服务器的日志通道不受影响、不会卡死。
         sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
         #!/bin/bash
         STACK="${1:-dual}"
         LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
+        LAN6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+' || true)
+
         cd /var/lib/wgcf && wgcf generate >/dev/null 2>&1
         cp wgcf-profile.conf /etc/wireguard/warp.conf
-        sed -i '/^DNS/d;/PostUp/d;/PostDown/d;/^Endpoint/d' /etc/wireguard/warp.conf
+        sed -i '/^DNS/d;/PostUp/d;/PostDown/d' /etc/wireguard/warp.conf
         sed -i "/\[Interface\]/a DNS = off" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
         grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
 
+        # 默认双栈走 0.0.0.0/0 + ::/0（全局），ipv4/ipv6 单栈时只接管对应族
         if [ "$STACK" = "ipv4" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
-          EP=$(warp-endpoint-pick v4)
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
+          echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
         elif [ "$STACK" = "ipv6" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
-          EP=$(warp-endpoint-pick v6)
-        else
-          # dual: 随机选 v4 或 v6 endpoint 接入（AllowedIPs 仍是双栈）
-          if (( RANDOM % 2 )); then EP=$(warp-endpoint-pick v4); else EP=$(warp-endpoint-pick v6); fi
+          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf
+          echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
         fi
+        # dual 模式直接用 wgcf generate 自带的 0.0.0.0/0 + ::/0，不用动
 
-        echo "Endpoint = ${EP}" >> /etc/wireguard/warp.conf
-        echo "[warp-wg-build] using endpoint: ${EP}" >&2
+        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
+        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main pref 100" /etc/wireguard/warp.conf
+        if [ -n "$LAN6" ]; then
+          sed -i "/\[Interface\]/a PostDown = ip -6 rule delete from ${LAN6} lookup main" /etc/wireguard/warp.conf
+          sed -i "/\[Interface\]/a PostUp = ip -6 rule add from ${LAN6} lookup main pref 100" /etc/wireguard/warp.conf
+        fi
         B
         sudo chmod +x /usr/local/bin/warp-wg-build
 
@@ -78,14 +64,15 @@ runs:
         [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "\$D/last.conf"
         wg-quick down warp >/dev/null 2>&1 || true
 
-        # 彻底清理设备身份，确保下次注册是"全新设备"，
-        # 不止删 account.toml，把 wgcf 可能留下的缓存/identity 一起清
+        # 清理设备身份，确保每次是"全新设备"重新注册
         rm -f "\$D/wgcf-account.toml" "\$D/wgcf-identity.json" "\$D"/wgcf-profile.conf
 
         cd "\$D" && wgcf register --accept-tos >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
         warp-wg-build "\$STACK" || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
         wg-quick up warp >/dev/null 2>&1 || { [ -f "\$D/last.conf" ] && cp "\$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1; exit 1; }
 
+        # 全局模式下 curl 默认走 WARP（因为 0.0.0.0/0 已接管），
+        # 用它验证隧道本身是否真的握手成功并出网
         for _ in \$(seq 1 8); do
           curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)\$' && exit 0
           sleep 1
@@ -98,9 +85,13 @@ runs:
         ok=0
         for i in $(seq 1 5); do
           sudo warp-rotate "$STACK" && ok=1 && break
-          # 随机 jitter，避免在同一时间窗口反复打同一个边缘节点
           sleep $((RANDOM % 8 + i * 2))
         done
         [ "$ok" -eq 1 ] || { echo "WARP failed"; exit 1; }
-        echo "IPv4: $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
-        echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
+
+        echo "WARP is up (global mode). GitHub Actions logging still goes via LAN bypass rule."
+        echo "IPv4 (via WARP): $(curl -4s --connect-timeout 5 https://api.ipify.org || echo N/A)"
+        echo "IPv6 (via WARP): $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
+        echo
+        echo "提示：全局模式下，Selenium/SeleniumBase 不需要再单独配置 --proxy-server，"
+        echo "Chrome 默认网络流量会自动走 WARP 隧道出网。"
