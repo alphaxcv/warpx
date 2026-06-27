@@ -3,7 +3,7 @@ description: Cloudflare WARP global mode with optional IP rotation.
 
 inputs:
   rotate-times:
-    description: ""
+    description: "IP rotate count after initial connect (0 = no rotate)"
     required: false
     default: "3"
 
