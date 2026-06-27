@@ -58,4 +58,3 @@ runs:
         echo "trace: $(timeout 8s curl -s https://cloudflare.com/cdn-cgi/trace | tr '\n' ' ' || true)"
         echo "egress IPv4: $(timeout 8s curl -4 -fsS https://api.ipify.org || echo N/A)"
         echo "egress IPv6: $(timeout 8s curl -6 -fsS https://api64.ipify.org || echo N/A)"
-        echo "WARP ready."
