@@ -1,9 +1,9 @@
 name: Setup WARP
-description: Setup Cloudflare WARP in global mode, with GitHub/apt bypass rules and optional IP rotation.
+description: Setup Cloudflare WARP in global mode, keep GitHub Actions logs/control-plane and apt endpoints on direct route, and support optional IP rotation.
 
 inputs:
   stack:
-    description: "informational only"
+    description: "informational only; warp-cli has no v4/v6-only switch"
     required: false
     default: dual
   rotate-times:
@@ -19,10 +19,12 @@ runs:
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
 
+        # base deps
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
           curl gnupg lsb-release jq iproute2 dnsutils coreutils
 
+        # install cloudflare-warp
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
           | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
@@ -34,6 +36,7 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends cloudflare-warp
 
+        # start daemon
         sudo nohup warp-svc >/tmp/warp-svc.log 2>&1 &
         sleep 3
 
@@ -47,18 +50,21 @@ runs:
         sudo tee /usr/local/bin/warp-fetch-bypass-cidrs >/dev/null <<'EOF'
         #!/bin/bash
         set -euo pipefail
+
         OUT="${1:-/var/lib/cloudflare-warp/bypass-cidrs.txt}"
         TMP="$(mktemp)"
         sudo mkdir -p "$(dirname "$OUT")"
 
-        # GitHub official meta CIDRs
+        # 1) GitHub official ranges for api/web/git/hooks
         META="$(timeout 20s curl -fsSL https://api.github.com/meta || true)"
         if [ -n "$META" ]; then
-          echo "$META" | jq -r '(.api // []), (.web // []), (.git // []), (.hooks // []) | .[]' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' >> "$TMP" || true
+          echo "$META" | jq -r '
+            (.api // []), (.web // []), (.git // []), (.hooks // [])
+            | .[]
+          ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' >> "$TMP" || true
         fi
 
-        # apt / Azure common endpoints as /32
+        # 2) apt/azure common endpoints -> /32 direct route
         for h in archive.ubuntu.com security.ubuntu.com azure.archive.ubuntu.com packages.microsoft.com; do
           timeout 8s dig +short A "$h" \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -67,6 +73,7 @@ runs:
 
         sort -u "$TMP" | sudo tee "$OUT" >/dev/null
         rm -f "$TMP"
+
         echo "[warp-fetch-bypass-cidrs] fetched $(wc -l < "$OUT") CIDR ranges -> $OUT" >&2
         EOF
         sudo chmod +x /usr/local/bin/warp-fetch-bypass-cidrs
@@ -77,12 +84,13 @@ runs:
         CIDRS=/var/lib/cloudflare-warp/bypass-cidrs.txt
         PREF=100
 
+        # remove old pref=100 rules
         while ip rule show | grep -q "pref ${PREF} "; do
           R=$(ip rule show | grep "pref ${PREF} " | head -n1 | sed -E 's/^([0-9]+):.*/\1/')
           ip rule delete pref "$R" 2>/dev/null || break
         done
 
-        [ -f "$CIDRS" ] || exit 0
+        [ -f "$CIDRS" ] || { echo "[warp-apply-bypass] warn: $CIDRS missing, skip" >&2; exit 0; }
 
         while read -r cidr; do
           [ -z "$cidr" ] && continue
@@ -96,6 +104,13 @@ runs:
         sudo tee /usr/local/bin/warp-connect >/dev/null <<'EOF'
         #!/bin/bash
         set -euo pipefail
+
+        # initial connect path: create registration only if missing
+        if ! timeout 8s warp-cli --accept-tos registration show >/dev/null 2>&1; then
+          echo "[warp-connect] no registration, creating..." >&2
+          timeout 45s warp-cli --accept-tos registration new >/dev/null 2>&1
+        fi
+
         timeout 20s warp-cli --accept-tos mode warp >/dev/null 2>&1 || true
         timeout 40s warp-cli --accept-tos connect >/dev/null 2>&1
 
@@ -105,6 +120,8 @@ runs:
           fi
           sleep 1
         done
+
+        echo "[warp-connect] warp trace check failed" >&2
         exit 1
         EOF
         sudo chmod +x /usr/local/bin/warp-connect
@@ -117,6 +134,7 @@ runs:
         [ -n "$BEFORE_IP" ] || BEFORE_IP="N/A"
         echo "[warp-rotate] before ip: $BEFORE_IP" >&2
 
+        # rotate path only: re-register to force identity/IP change
         timeout 20s warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
         timeout 20s warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
         timeout 45s warp-cli --accept-tos registration new >/dev/null 2>&1
@@ -135,14 +153,18 @@ runs:
         AFTER_IP="$(warp-current-ip || true)"
         [ -n "$AFTER_IP" ] || AFTER_IP="N/A"
         echo "[warp-rotate] after  ip: $AFTER_IP" >&2
+
+        if [ "$BEFORE_IP" = "$AFTER_IP" ] && [ "$AFTER_IP" != "N/A" ]; then
+          echo "[warp-rotate] warn: egress IP unchanged this cycle" >&2
+        fi
         EOF
         sudo chmod +x /usr/local/bin/warp-rotate
 
-        # 1) fetch/apply bypass first
+        # prepare bypass rules first
         sudo warp-fetch-bypass-cidrs
         sudo warp-apply-bypass
 
-        # 2) initial connect (NO registration delete/new here)
+        # initial connect (NO registration delete here)
         if ! sudo warp-connect; then
           echo "[setup-warp] initial connect failed, restarting warp-svc once..." >&2
           sudo pkill -f warp-svc >/dev/null 2>&1 || true
@@ -151,7 +173,7 @@ runs:
           sudo warp-connect || { echo "WARP failed"; cat /tmp/warp-svc.log; exit 1; }
         fi
 
-        # 3) optional rotations (ONLY here we re-register)
+        # optional rotation cycles
         ROTATE_TIMES="${{ inputs.rotate-times }}"
         if ! [[ "$ROTATE_TIMES" =~ ^[0-9]+$ ]]; then
           echo "[setup-warp] invalid rotate-times='$ROTATE_TIMES', fallback to 0" >&2
