@@ -1,118 +1,61 @@
 name: Setup WARP
-description: WireGuard global + ip rule from LAN + wgcf rotate(until IP changes, max 3)
+description: Cloudflare WARP global mode with optional IP rotation.
 
 inputs:
-  stack:
-    description: "ipv4, ipv6, or dual"
+  rotate-times:
+    description: "IP rotate count after initial connect (0 = no rotate)"
     required: false
-    default: dual
+    default: "0"
 
 runs:
   using: composite
   steps:
     - shell: bash
       run: |
-        set -e
+        set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
-        STACK="${{ inputs.stack }}"
 
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends wireguard-tools iproute2 curl
-        curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
-          | sudo tee /usr/local/bin/wgcf >/dev/null
-        sudo chmod +x /usr/local/bin/wgcf
-        sudo mkdir -p /var/lib/wgcf
+        sudo apt-get install -y --no-install-recommends curl gnupg lsb-release
 
-        sudo tee /usr/local/bin/warp-wg-build >/dev/null <<'B'
-        #!/bin/bash
-        set -e
-        STACK="${1:-dual}"
-        LAN=$(ip route get 192.168.193.10 | grep -oP 'src \K\S+')
-        cd /var/lib/wgcf && wgcf generate >/dev/null 2>&1
-        cp wgcf-profile.conf /etc/wireguard/warp.conf
-        sed -i '/^DNS/d;/PostUp/d;/PostDown/d' /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a DNS = off" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostDown = ip -4 rule delete from ${LAN} lookup main" /etc/wireguard/warp.conf
-        sed -i "/\[Interface\]/a PostUp = ip -4 rule add from ${LAN} lookup main" /etc/wireguard/warp.conf
-        grep -q '^MTU' /etc/wireguard/warp.conf || sed -i "/\[Interface\]/a MTU = 1280" /etc/wireguard/warp.conf
-        if [ "$STACK" = "ipv4" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = 0.0.0.0/0" >> /etc/wireguard/warp.conf
-        elif [ "$STACK" = "ipv6" ]; then
-          sed -i '/^AllowedIPs/d' /etc/wireguard/warp.conf && echo "AllowedIPs = ::/0" >> /etc/wireguard/warp.conf
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends cloudflare-warp
+
+        sudo nohup warp-svc >/tmp/warp-svc.log 2>&1 &
+        sleep 3
+
+        # initial connect: create registration only if missing
+        if ! timeout 8s warp-cli --accept-tos registration show >/dev/null 2>&1; then
+          timeout 45s warp-cli --accept-tos registration new >/dev/null 2>&1
         fi
-        B
-        sudo chmod +x /usr/local/bin/warp-wg-build
+        timeout 20s warp-cli --accept-tos mode warp >/dev/null 2>&1 || true
+        timeout 45s warp-cli --accept-tos connect >/dev/null 2>&1
 
-        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'R'
-        #!/bin/bash
-        set -e
-        STACK="${1:-dual}"
-        D=/var/lib/wgcf
-        [ -f /etc/wireguard/warp.conf ] && cp /etc/wireguard/warp.conf "$D/last.conf"
+        # verify warp on
+        timeout 12s bash -c 'for i in $(seq 1 12); do timeout 5s curl -s https://cloudflare.com/cdn-cgi/trace | grep -qE "^warp=(on|plus)$" && exit 0; sleep 1; done; exit 1'
 
-        wg-quick down warp >/dev/null 2>&1 || true
-        rm -f "$D/wgcf-account.toml"
+        # optional rotation
+        ROTATE_TIMES="${{ inputs.rotate-times }}"
+        [[ "$ROTATE_TIMES" =~ ^[0-9]+$ ]] || ROTATE_TIMES=0
 
-        # longer jitter to reduce same allocation hit
-        sleep $((RANDOM % 31 + 15))   # 15~45s
-
-        cd "$D" && wgcf register --accept-tos >/dev/null 2>&1 || {
-          [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
-          exit 1
-        }
-
-        warp-wg-build "$STACK" >/dev/null 2>&1 || {
-          [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
-          exit 1
-        }
-
-        wg-quick up warp >/dev/null 2>&1 || {
-          [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
-          exit 1
-        }
-
-        for _ in $(seq 1 12); do
-          curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' && exit 0
-          sleep 1
+        for _ in $(seq 1 "$ROTATE_TIMES"); do
+          timeout 20s warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+          timeout 20s warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+          timeout 45s warp-cli --accept-tos registration new >/dev/null 2>&1
+          timeout 20s warp-cli --accept-tos mode warp >/dev/null 2>&1
+          timeout 45s warp-cli --accept-tos connect >/dev/null 2>&1
+          timeout 12s bash -c 'for i in $(seq 1 12); do timeout 5s curl -s https://cloudflare.com/cdn-cgi/trace | grep -qE "^warp=(on|plus)$" && exit 0; sleep 1; done; exit 1'
         done
 
-        wg-quick down warp >/dev/null 2>&1 || true
-        sleep $((RANDOM % 21 + 20))   # 20~40s
-        [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
-        exit 1
-        R
-        sudo chmod +x /usr/local/bin/warp-rotate
-
-        get_ip4() { curl -4s --connect-timeout 5 https://api.ipify.org || true; }
-
-        BASE_IP="$(get_ip4)"
-        [ -n "$BASE_IP" ] || BASE_IP="N/A"
-        echo "[warp] base IPv4: $BASE_IP"
-
-        changed=0
-        current="$BASE_IP"
-
-        for n in 1 2 3; do
-          echo "[warp] rotate attempt $n/3"
-          sudo warp-rotate "$STACK" || { echo "WARP failed on attempt $n"; exit 1; }
-
-          new_ip="$(get_ip4)"
-          [ -n "$new_ip" ] || new_ip="N/A"
-          echo "[warp] IPv4 after attempt $n: $new_ip"
-
-          if [ "$BASE_IP" != "N/A" ] && [ "$new_ip" != "N/A" ] && [ "$new_ip" != "$BASE_IP" ]; then
-            changed=1
-            current="$new_ip"
-            echo "[warp] IPv4 changed on attempt $n"
-            break
-          fi
-
-          current="$new_ip"
-        done
-
-        if [ "$changed" -ne 1 ]; then
-          echo "[warp] warning: IPv4 did not change after max 3 attempts"
-        fi
-
-        echo "IPv4: $current"
-        echo "IPv6: $(curl -6s --connect-timeout 5 https://api64.ipify.org || echo N/A)"
+        # diagnostics
+        echo "warp status: $(timeout 8s warp-cli --accept-tos status 2>/dev/null || echo unknown)"
+        echo "trace: $(timeout 8s curl -s https://cloudflare.com/cdn-cgi/trace | tr '\n' ' ' || true)"
+        echo "egress IPv4: $(timeout 8s curl -4 -fsS https://api.ipify.org || echo N/A)"
+        echo "egress IPv6: $(timeout 8s curl -6 -fsS https://api64.ipify.org || echo N/A)"
+        echo "WARP ready."
