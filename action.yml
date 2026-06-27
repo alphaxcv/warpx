@@ -53,8 +53,8 @@ runs:
         wg-quick down warp >/dev/null 2>&1 || true
         rm -f "$D/wgcf-account.toml"
 
-        # jitter to reduce same allocation hit
-        sleep $((RANDOM % 7 + 2))
+        # longer jitter to reduce same allocation hit
+        sleep $((RANDOM % 31 + 15))   # 15~45s
 
         cd "$D" && wgcf register --accept-tos >/dev/null 2>&1 || {
           [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
@@ -71,11 +71,13 @@ runs:
           exit 1
         }
 
-        for _ in $(seq 1 8); do
+        for _ in $(seq 1 12); do
           curl -4sf --connect-timeout 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)$' && exit 0
           sleep 1
         done
 
+        wg-quick down warp >/dev/null 2>&1 || true
+        sleep $((RANDOM % 21 + 20))   # 20~40s
         [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
         exit 1
         R
