@@ -43,7 +43,7 @@ runs:
         B
         sudo chmod +x /usr/local/bin/warp-wg-build
 
-        sudo tee /usr/local/bin/warp-rotate-once >/dev/null <<'R'
+        sudo tee /usr/local/bin/warp-rotate >/dev/null <<'R'
         #!/bin/bash
         set -e
         STACK="${1:-dual}"
@@ -79,7 +79,7 @@ runs:
         [ -f "$D/last.conf" ] && cp "$D/last.conf" /etc/wireguard/warp.conf && wg-quick up warp >/dev/null 2>&1
         exit 1
         R
-        sudo chmod +x /usr/local/bin/warp-rotate-once
+        sudo chmod +x /usr/local/bin/warp-rotate
 
         get_ip4() { curl -4s --connect-timeout 5 https://api.ipify.org || true; }
 
@@ -92,7 +92,7 @@ runs:
 
         for n in 1 2 3; do
           echo "[warp] rotate attempt $n/3"
-          sudo warp-rotate-once "$STACK" || { echo "WARP failed on attempt $n"; exit 1; }
+          sudo warp-rotate "$STACK" || { echo "WARP failed on attempt $n"; exit 1; }
 
           new_ip="$(get_ip4)"
           [ -n "$new_ip" ] || new_ip="N/A"
